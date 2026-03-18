@@ -1,210 +1,165 @@
-<div align="center">
+﻿# OpenGaussian 语义 + seg3D实例 完整流程文档
 
-# [NeurIPS2024🔥] OpenGaussian: Towards Point-Level 3D Gaussian-based Open Vocabulary Understanding
+本文档适用于你当前流程：
+- 从 Stage1 训练点云开始
+- KMeans 聚类得到 class_*.ply
+- 2D 语义mask投票完成语义映射
+- 对指定语义类别做 seg3D 风格实例分割（proj2d）
 
-<!-- <a href="https://arxiv.org/abs/2406.02058"><strong>Paper</strong></a> |  -->
+## 1. 环境与路径约定
 
-<h3>
-  <strong>Paper(<a href="https://arxiv.org/abs/2406.02058">arXiv</a> / <a href="https://proceedings.neurips.cc/paper_files/paper/2024/hash/21f7b745f73ce0d1f9bcea7f40b1388e-Abstract-Conference.html">Conference</a>)</strong> | 
-  <a href="https://3d-aigc.github.io/OpenGaussian/"><strong>Project Page</strong></a>
-</h3>
+WSL 示例路径：
+- 项目目录：`/mnt/d/OpenGaussian-original-20260310`
+- 场景目录：`/mnt/d/Scene_roi`
+- 2D 语义mask目录：`/mnt/d/Scene_roi/language_features`（`*_s.npy`）
+- 2D 实例mask目录：`/mnt/d/Scene_roi/language_features_instance`（`*_inst.npy`）
 
-<!-- [**Paper**](https://arxiv.org/abs/2406.02058) | [**Project Page**](https://3d-aigc.github.io/OpenGaussian/) -->
-<!-- [![arXiv](https://img.shields.io/badge/arXiv-<Paper>-<COLOR>.svg)](https://arxiv.org/abs/2406.02058)
-[![Project Page](https://img.shields.io/badge/Project_Page-<Website>-blue.svg)](https://3d-aigc.github.io/OpenGaussian/) -->
+进入项目：
 
-[Yanmin Wu](https://yanmin-wu.github.io/)<sup>1</sup>, [Jiarui Meng](https://scholar.google.com/citations?user=N_pRAVAAAAAJ&hl=en&oi=ao)<sup>1</sup>, [Haijie Li](https://villa.jianzhang.tech/people/haijie-li-%E6%9D%8E%E6%B5%B7%E6%9D%B0/)<sup>1</sup>, [Chenming Wu](https://chenming-wu.github.io/)<sup>2*</sup>, [Yahao Shi](https://scholar.google.com/citations?user=-VJZrUkAAAAJ&hl=en)<sup>3</sup>, [Xinhua Cheng](https://cxh0519.github.io/)<sup>1</sup>, 
-[Chen Zhao](https://openreview.net/profile?id=~Chen_Zhao9)<sup>2</sup>, [Haocheng Feng](https://openreview.net/profile?id=~Haocheng_Feng1)<sup>2</sup>, [Errui Ding](https://scholar.google.com/citations?user=1wzEtxcAAAAJ&hl=zh-CN)<sup>2</sup>, [Jingdong Wang](https://jingdongwang2017.github.io/)<sup>2</sup>, [Jian Zhang](https://jianzhang.tech/)<sup>1*</sup>
-
-<sup>1</sup> Peking University, <sup>2</sup> Baidu VIS, <sup>3</sup> Beihang University
-
-</div>
-
-## 0. Installation
-
-The installation of OpenGaussian is similar to [3D Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting).
+```bash
+cd /mnt/d/OpenGaussian-original-20260310
 ```
-git clone https://github.com/yanmin-wu/OpenGaussian.git
-```
-Then install the dependencies:
-```shell
-conda env create --file environment.yml
-conda activate gaussian_splatting
 
-# the rasterization lib comes from DreamGaussian
-cd OpenGaussian/submodules
-unzip ashawkey-diff-gaussian-rasterization.zip
-pip install ./ashawkey-diff-gaussian-rasterization
-```
-+ other additional dependencies: bitarray, scipy, [pytorch3d](https://anaconda.org/pytorch3d/pytorch3d/files)
-    ```shell
-    pip install bitarray scipy
-    
-    # install a pytorch3d version compatible with your PyTorch, Python, and CUDA.
-    ```
-+ `simple-knn` is not required
+## 2. Stage1 训练流程
 
----
+### 2.1 直接跑官方脚本（ScanNet / LeRF）
 
-## 1. ToDo list
-
-+ [x] Point feature visualization
-+ [x] Data preprocessing
-+ ~~[ ] Improved SAM mask extraction (extracting only one layer)~~
-+ [x] Click to Select 3D Object
-
----
-
-## 2. Data preparation
-The files are as follows:
-```
-[DATA_ROOT]
-├── [1] scannet/
-│   │   ├── scene0000_00/
-|   |   |   |── color/
-|   |   |   |── language_features/
-|   |   |   |── points3d.ply
-|   |   |   |── transforms_train/test.json
-|   |   |   |── *_vh_clean_2.labels.ply
-│   │   ├── scene0062_00/
-│   │   └── ...
-├── [2] lerf_ovs/
-│   │   ├── figurines/ & ramen/ & teatime/ & waldo_kitchen/
-|   |   |   |── images/
-|   |   |   |── language_features/
-|   |   |   |── sparse/
-│   │   ├── label/
-```
-+ **[1] Prepare ScanNet Data**
-    + You can directly download our pre-processed data: [**OneDrive**](https://onedrive.live.com/?authkey=%21AIgsXZy3gl%5FuKmM&id=744D3E86422BE3C9%2139813&cid=744D3E86422BE3C9) / [Baidu](https://pan.baidu.com/s/1B_tGYla5dWyJRu3jTNTMvA?pwd=u5iy). Please unzip the `color.zip` and `language_features.zip` files.
-    + The ScanNet dataset requires permission for use, following the [ScanNet instructions](https://github.com/ScanNet/ScanNet) to apply for dataset permission.
-    + **If you want to process more scenes from the ScanNet dataset, you can follow these steps:**
-	    + First, use the official `download-scannet.py` script provided by ScanNet to download the `.sens` archive of the specified scenes;
-	    + Then, refer to the [`preprocess_2d_scannet.py`](https://github.com/pengsongyou/openscene/blob/main/scripts/preprocess/preprocess_2d_scannet.py) script to extract the `color` and `pose` information;
-	    + Finally, convert the data into Blender format using the [`scripts/scannet2blender.py`](https://github.com/yanmin-wu/OpenGaussian/blob/main/scripts/scannet2blender.py) script. Please check the `TODO` comments in the script to specify the paths.
-+ **[2] Prepare lerf_ovs Data**
-    + You can directly download our pre-processed data: [**OneDrive**](https://onedrive.live.com/?authkey=%21AIgsXZy3gl%5FuKmM&id=744D3E86422BE3C9%2139815&cid=744D3E86422BE3C9) / [Baidu](https://pan.baidu.com/s/1B_tGYla5dWyJRu3jTNTMvA?pwd=u5iy) (re-annotated by LangSplat). Please unzip the `images.zip` and `language_features.zip` files.
-+ **Mask and Language Feature Extraction Details**
-    + We use the tools provided by LangSplat to extract the SAM mask and CLIP features, but we only use the large-level mask.
-
----
-
-## 3. Training
-### 3.1 ScanNet
-```shell
+```bash
 chmod +x scripts/train_scannet.sh
 ./scripts/train_scannet.sh
 ```
-+ Please ***check*** the script for more details and ***modify*** the dataset path.
-+ you will see the following processes during training:
-    ```shell
-    [Stage 0] Start 3dgs pre-train ... (step 0-30k)
-    [Stage 1] Start continuous instance feature learning ... (step 30-50k)
-    [Stage 2.1] Start coarse-level codebook discretization ... (step 50-70k)
-    [Stage 2.2] Start fine-level codebook discretization ... (step 70-90k)
-    [Stage 3] Start 2D language feature - 3D cluster association ... (1 min)
-    ```
-+ Intermediate results from different stages can be found in subfolders `***/train_process/stage*`. (The intermediate results of stage 3 are recommended to be observed in the LeRF dataset.)
 
-### 3.2 LeRF_ovs
-```shell
+或：
+
+```bash
 chmod +x scripts/train_lerf.sh
 ./scripts/train_lerf.sh
 ```
-+ Please ***check*** the script for more details and ***modify*** the dataset path.
-+ you will see the following processes during training:
-    ```shell
-    [Stage 0] Start 3dgs pre-train ... (step 0-30k)
-    [Stage 1] Start continuous instance feature learning ... (step 30-40k)
-    [Stage 2.1] Start coarse-level codebook discretization ... (step 40-50k)
-    [Stage 2.2] Start fine-level codebook discretization ... (step 50-70k)
-    [Stage 3] Start 2D language feature - 3D cluster association ... (1 min)
-    ```
-+ Intermediate results from different stages can be found in subfolders `***/train_process/stage*`.
 
-### 3.3 Custom data
-+ Without any special processing, videos are first captured, approximately 200 frames are sampled, and COLMAP is then used to initialize the point cloud and camera poses.
+说明：
+- 这两个脚本会跑完整训练（Stage0 -> Stage3）
+- 请先修改脚本里的数据路径和 GPU 编号
 
----
+### 2.2 只训练到 Stage1（推荐给你当前流程）
 
-## 4. Render & Eval & Downstream Tasks
+如果你只需要 Stage1 后的点云用于后续语义+实例流程，建议用手动命令只跑到 Stage1 结束：
 
-### 4.1 3D Instance Feature Visualization
-+ Please install `open3d` first, and then execute the following command on a system with UI support:
-    ```python
-    python scripts/vis_opengs_pts_feat.py
-    ```
-    + Please specify `ply_path` in the script as the PLY file `output/xxxxxxxx-x/point_cloud/iteration_x0000/point_cloud.ply` saved at different stages.
-    + During the training process, we have saved the first three dimensions of the 6D features as colors for visualization; see [here](https://github.com/yanmin-wu/OpenGaussian/blob/2845b9c744c1b06ac6930ffa2d2a6f9167f1b843/scene/gaussian_model.py#L272).
-
-### 4.2 Render 2D Feature Map
-+ The same rendering method as the 3DGS rendering colors.
-    ```shell
-    python render.py -m "output/xxxxxxxx-x"
-    ```
-    You can find the rendered feature maps in subfolders `renders_ins_feat1` and `renders_ins_feat2`.
-
-### 4.3 ScanNet Evalution (Open-Vocabulary Point Cloud Understanding)
-> Due to code optimization and the use of more suitable hyperparameters, the latest evaluation metrics may be higher than those reported in the paper. 
-+ Evaluate text-guided segmentation performance on ScanNet for 19, 15, and 10 categories.
-    ```shell
-    # unzip the pre-extracted text features
-    cd assets
-    unzip text_features.zip
-
-    # 1. please check the `gt_file_path` and `model_path` are correct
-    # 2. specify `target_id` as 19, 15, or 10 categories.
-    python scripts/eval_scannet.py
-    ```
-
-### 4.4 LeRF Evalution (Open-Vocabulary Object Selection in 3D Space)
-+ (1) First, render text-selected 3D Gaussians into multi-view images.
-    ```shell
-    # unzip the pre-extracted text features
-    cd assets
-    unzip text_features.zip
-
-    # 1. specify the model path using -m
-    # 2. specify the scene name: figurines, teatime, ramen, waldo_kitchen
-    python render_lerf_by_text.py -m "output/xxxxxxxx-x" --scene_name "figurines"
-    ```
-    The object selection results are saved in `output/xxxxxxxx-x/text2obj/ours_70000/renders_cluster`.
-
-+ (2) Then, compute evaluation metrics.
-    > Due to code optimization and the use of more suitable hyperparameters, the latest evaluation metrics may be higher than those reported in the paper. 
-    > The metrics may be unstable due to the limited evaluation samples of LeRF.
-    ```shell
-    # 1. change path_gt and path_pred in the script
-    # 2. specify the scene name: figurines, teatime, ramen, waldo_kitchen
-    python scripts/compute_lerf_iou.py --scene_name "figurines"
-    ```
-
-### 4.5 Click to Select 3D Object
-
-+ (1) First, you need to render the feature maps (refer to Step 4.3; in practice, only two feature maps from a single view are required).
-+ (2) Then, check the [`scripts/render_by_click.py`](https://github.com/yanmin-wu/OpenGaussian/blob/main/scripts/render_by_click.py) script for `TODO` comments, including specifying the frame filename, clicked pixel coordinates, and file paths.
-+ (3) Finally, run the [`scripts/render_by_click.py`](https://github.com/yanmin-wu/OpenGaussian/blob/main/scripts/render_by_click.py) script. *Note that this script has not been tested with the current version of the code and may require debugging*.
-
----
-
-## 5. Acknowledgements
-We are quite grateful for [3DGS](https://github.com/graphdeco-inria/gaussian-splatting), [LangSplat](https://github.com/minghanqin/LangSplat), [CompGS](https://github.com/UCDvision/compact3d), [LEGaussians](https://github.com/buaavrcg/LEGaussians), [SAGA](https://github.com/Jumpat/SegAnyGAussians), and [SAM](https://segment-anything.com/).
-
----
-
-## 6. Citation
-
-```
-@inproceedings{wu2024opengaussian,
-    title={OpenGaussian: Towards Point-Level 3D Gaussian-based Open Vocabulary Understanding},
-    author={Wu, Yanmin and Meng, Jiarui and Li, Haijie and Wu, Chenming and Shi, Yahao and Cheng, Xinhua and Zhao, Chen and Feng, Haocheng and Ding, Errui and Wang, Jingdong and Zhang, Jian},
-    booktitle={Proceedings of the Advances in Neural Information Processing Systems (NeurIPS)},
-    pages={19114--19138},
-    year={2024}
-}
+```bash
+CUDA_VISIBLE_DEVICES=0 python train.py \
+  -s /mnt/d/Scene_roi \
+  -m /mnt/d/Scene/out_stage1 \
+  --iterations 50000 \
+  --start_ins_feat_iter 30000 \
+  --start_root_cb_iter 50001 \
+  --start_leaf_cb_iter 70000 \
+  --sam_level 0 \
+  --save_iterations 30000 50000 \
+  --eval
 ```
 
----
+说明：
+- `--iterations 50000`：训练到 Stage1 末尾
+- `--start_root_cb_iter 50001`：避免进入 Stage2
+- 输出点云在：
+  - `/mnt/d/Scene/out_stage1/point_cloud/iteration_50000/point_cloud.ply`
 
-## 7. Contact
-If you have any questions about this project, please feel free to contact [Yanmin Wu](https://yanmin-wu.github.io/): wuyanminmax[AT]gmail.com
+## 3. Stage1 点云做 KMeans（8类）
+
+```bash
+python scripts/cluster_semantic_kmeans.py \
+  --input_ply /mnt/d/Scene/out_stage1/point_cloud/iteration_50000/point_cloud.ply \
+  --output_dir /mnt/d/Scene/out_stage1/kmeans_8 \
+  --n_clusters 8 \
+  --assign_full \
+  --save_npz
+```
+
+输出核心文件：
+- `/mnt/d/Scene/out_stage1/kmeans_8/class_0.ply ... class_7.ply`
+
+## 4. 一体化流程：语义投票 + 语义模型合并 + seg3D实例（proj2d）
+
+脚本：`scripts/semantic_instance_pipeline.py`
+
+```bash
+python scripts/semantic_instance_pipeline.py \
+  --scene_path /mnt/d/Scene_roi \
+  --cluster_dir /mnt/d/Scene/out_stage1/kmeans_8 \
+  --output_dir /mnt/d/Scene_roi/sem_ins_proj2d \
+  --mask_level 0 \
+  --vote_stride 1 \
+  --vote_ignore_ids "0,7" \
+  --min_votes 800 \
+  --min_top1_ratio 0.4 \
+  --id2label "0:background,1:vehicle,2:person,3:bicycle,4:vegetation,5:road,6:traffic_facility,7:other" \
+  --stuff_ids "0,4,5,6,7,255" \
+  --instance_only_ids "1" \
+  --instance_method proj2d \
+  --instance_mask_dir /mnt/d/Scene_roi/language_features_instance \
+  --instance_mask_mode name \
+  --instance_mask_suffix "_inst.npy" \
+  --instance_mask_level 0 \
+  --instance_mask_ignore_ids "0" \
+  --instance_min_mask_points 30 \
+  --instance_match_iou 0.2 \
+  --instance_min_point_votes 2 \
+  --min_instance_points 180
+```
+
+说明：
+- `--instance_method proj2d`：使用 seg3D 风格 2D 实例反投影
+- `--instance_only_ids "1"`：只对 vehicle 做实例分割
+- `--stuff_ids` 中的类别不会做实例分割
+- `--vote_ignore_ids "0,7"`：语义投票时忽略背景/other，提升 vehicle 归类稳定性
+
+输出核心文件：
+- `.../sem_ins_proj2d/semantic_models/<id_label>/merged_semantic.ply`
+- `.../sem_ins_proj2d/semantic_instance/001_vehicle_sem_ins.ply`
+- `.../sem_ins_proj2d/semantic_instance/001_vehicle_instances/instance_*.ply`
+- `.../sem_ins_proj2d/semantic_instance_report.json`
+
+## 5. 已有语义模型时，只跑实例分割
+
+如果你已经有 `semantic_models`（比如 `sem_ins_center_vote/semantic_models`），可以跳过语义投票，直接跑实例：
+
+脚本：`scripts/semantic_models_seg3d_instance.py`
+
+```bash
+python scripts/semantic_models_seg3d_instance.py \
+  --scene_path /mnt/d/Scene_roi \
+  --semantic_models_dir /mnt/d/Scene_roi/sem_ins_center_vote/semantic_models \
+  --output_dir /mnt/d/Scene_roi/sem_ins_seg3d_instance \
+  --semantic_only_ids "1" \
+  --stuff_ids "0,4,5,6,7,255" \
+  --instance_mask_dir /mnt/d/Scene_roi/language_features_instance \
+  --instance_mask_mode name \
+  --instance_mask_suffix "_inst.npy" \
+  --instance_mask_level 0 \
+  --instance_mask_ignore_ids "0" \
+  --vote_stride 1 \
+  --instance_min_mask_points 30 \
+  --instance_match_iou 0.2 \
+  --instance_min_point_votes 2 \
+  --min_instance_points 180 \
+  --save_instance_parts
+```
+
+## 6. 常用参数速查
+
+- 指定做实例的语义类：
+  - 一体化脚本：`--instance_only_ids "1"`
+  - 实例-only脚本：`--semantic_only_ids "1"`
+- 实例容易粘连：减小 `--instance_match_iou` 或减小 `--min_instance_points`
+- 实例噪声多：增大 `--instance_min_point_votes` 或增大 `--instance_min_mask_points`
+- 语义归类不稳：保持 `--vote_ignore_ids "0,7"`，必要时降低 `--min_top1_ratio`
+
+## 7. 快速验收
+
+先看这两个文件：
+- `semantic_instance/001_vehicle_sem_ins.ply`
+- `semantic_instance_report.json`
+
+重点检查：
+- `semantic_summary` 里 `semantic_id=1` 的 `num_instances`
+- `cluster_infos` 里 vehicle cluster 的 `accepted` 是否为 `true`
+- `assigned_semantic_id` 是否为预期类别（如 `1`）
