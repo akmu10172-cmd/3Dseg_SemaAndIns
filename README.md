@@ -40,26 +40,26 @@ chmod +x scripts/train_lerf.sh
 - 这两个脚本会跑完整训练（Stage0 -> Stage3）
 - 请先修改脚本里的数据路径和 GPU 编号
 
-### 2.2 只训练到 Stage1（推荐给你当前流程）
+### 2.2 只训练到Open Gaussian的Stage1
 
-如果你只需要 Stage1 后的点云用于后续语义+实例流程，建议用手动命令只跑到 Stage1 结束：
+只需要 Stage1 后的点云用于后续语义+实例流程，建议用手动命令只跑到 Stage1 结束：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python train.py \
-  -s /mnt/d/Scene_roi \
-  -m /mnt/d/Scene/out_stage1 \
-  --iterations 50000 \
-  --start_ins_feat_iter 30000 \
-  --start_root_cb_iter 50001 \
-  --start_leaf_cb_iter 70000 \
-  --sam_level 0 \
-  --save_iterations 30000 50000 \
-  --eval
+训练40000
+ python train.py  
+ -s /mnt/d/Scene_roi   
+ -m /mnt/d/Scene/out_original_roi_optm  
+ --start_checkpoint /mnt/d/Scene/out/chkpnt30000.pth   
+ --sam_level 0   
+ --iterations 40000   
+ --start_ins_feat_iter 30000   
+ --start_root_cb_iter 100000  
+ --start_leaf_cb_iter 120000  
+ --checkpoint_iterations 34000 40000  
+ --save_iterations 40000
 ```
 
 说明：
-- `--iterations 50000`：训练到 Stage1 末尾
-- `--start_root_cb_iter 50001`：避免进入 Stage2
 - 输出点云在：
   - `/mnt/d/Scene/out_stage1/point_cloud/iteration_50000/point_cloud.ply`
 
