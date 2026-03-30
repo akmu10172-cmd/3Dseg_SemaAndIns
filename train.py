@@ -156,9 +156,18 @@ def separation_loss(feat_mean_stack, iteration):
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, \
              checkpoint, debug_from):
-    iterations = [opt.start_ins_feat_iter, opt.start_leaf_cb_iter, opt.start_root_cb_iter]
-    saving_iterations.extend(iterations)
-    checkpoint_iterations.extend(iterations)
+    # Project mode: keep only Stage0 + Stage1 training.
+    # Stage2/Stage3 (codebook discretization + language association) are disabled.
+    stage1_only = True
+    if stage1_only:
+        print("[Mode] Stage1-only enabled: Stage2/Stage3 are disabled.")
+        sys.stdout.flush()
+
+    stage_milestones = [opt.start_ins_feat_iter]
+    if not stage1_only:
+        stage_milestones.extend([opt.start_leaf_cb_iter, opt.start_root_cb_iter])
+    saving_iterations.extend(stage_milestones)
+    checkpoint_iterations.extend(stage_milestones)
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -186,35 +195,34 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     else:
         ins_feat_continue = None    # not used
 
-    # initialize the codebook
-    ins_feat_codebook = Quantize_kMeans(num_clusters=opt.root_node_num,         # k1
-                                        num_leaf_clusters=opt.leaf_node_num,    # k2
-                                        num_iters=5, 
-                                        dim=9)
-    
-    # note: load the saved codebook
+    ins_feat_codebook = None
+    cluster_indices = None
     leaf_cluster_indices = None
-    if checkpoint:
-        base_dir = os.path.dirname(checkpoint)
-        load_iter = checkpoint.split('/')[-1].split('.')[0][6:]
-        root_code_book_path = os.path.join(base_dir, 'point_cloud', f"iteration_{load_iter}", "root_code_book")
-        leaf_code_book_path = os.path.join(base_dir, 'point_cloud', f"iteration_{load_iter}", "leaf_code_book")
-        if os.path.exists(os.path.join(root_code_book_path, 'kmeans_inds.bin')):
-            root_center, root_indices = load_code_book(root_code_book_path)
-            root_center_saved = root_center["ins_feat"]
-            cluster_indices = torch.from_numpy(root_indices).cuda()
-            ins_feat_codebook.centers = root_center_saved
-            ins_feat_codebook.cls_ids = cluster_indices
-        else:
-            cluster_indices = None
-        if os.path.exists(os.path.join(leaf_code_book_path, 'kmeans_inds.bin')):
-            leaf_center, leaf_indices = load_code_book(leaf_code_book_path)
-            leaf_center_saved = leaf_center["ins_feat"]
-            leaf_cluster_indices = torch.from_numpy(leaf_indices).cuda()
-            ins_feat_codebook.leaf_centers = leaf_center_saved
-            ins_feat_codebook.leaf_cls_ids = leaf_cluster_indices
-        else:
-            leaf_cluster_indices = None
+    if not stage1_only:
+        # initialize the codebook
+        ins_feat_codebook = Quantize_kMeans(num_clusters=opt.root_node_num,         # k1
+                                            num_leaf_clusters=opt.leaf_node_num,    # k2
+                                            num_iters=5,
+                                            dim=9)
+
+        # note: load the saved codebook
+        if checkpoint:
+            base_dir = os.path.dirname(checkpoint)
+            load_iter = checkpoint.split('/')[-1].split('.')[0][6:]
+            root_code_book_path = os.path.join(base_dir, 'point_cloud', f"iteration_{load_iter}", "root_code_book")
+            leaf_code_book_path = os.path.join(base_dir, 'point_cloud', f"iteration_{load_iter}", "leaf_code_book")
+            if os.path.exists(os.path.join(root_code_book_path, 'kmeans_inds.bin')):
+                root_center, root_indices = load_code_book(root_code_book_path)
+                root_center_saved = root_center["ins_feat"]
+                cluster_indices = torch.from_numpy(root_indices).cuda()
+                ins_feat_codebook.centers = root_center_saved
+                ins_feat_codebook.cls_ids = cluster_indices
+            if os.path.exists(os.path.join(leaf_code_book_path, 'kmeans_inds.bin')):
+                leaf_center, leaf_indices = load_code_book(leaf_code_book_path)
+                leaf_center_saved = leaf_center["ins_feat"]
+                leaf_cluster_indices = torch.from_numpy(leaf_indices).cuda()
+                ins_feat_codebook.leaf_centers = leaf_center_saved
+                ins_feat_codebook.leaf_cls_ids = leaf_cluster_indices
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -249,7 +257,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         iter_start.record()
 
-        gaussians.update_learning_rate(iteration, opt.start_root_cb_iter, opt.start_leaf_cb_iter)
+        # Keep Stage1 learning-rate behavior even when iteration > 40k.
+        if stage1_only:
+            gaussians.update_learning_rate(iteration, 10**12, 10**12 + 1)
+        else:
+            gaussians.update_learning_rate(iteration, opt.start_root_cb_iter, opt.start_leaf_cb_iter)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -269,31 +281,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if iteration == opt.start_ins_feat_iter + 1:
             print("[Stage 1] Start continuous instance feature learning ...")
             sys.stdout.flush()
-        # Stage 2.1: Coarse-level codebook
-        if iteration > opt.start_root_cb_iter and iteration <= opt.start_leaf_cb_iter:
-            cb_mode = "root"
-            if iteration == opt.start_root_cb_iter + 1:
-                print("[Stage 2.1] Start coarse-level codebook discretization ...")
-                sys.stdout.flush()
-        elif iteration > opt.start_leaf_cb_iter:
-            cb_mode = "leaf"
-            # Stage 2.2: Fine-level codebook
-            if iteration == opt.start_leaf_cb_iter + 1:
-                print("[Stage 2.2] Start fine-level codebook discretization ...")
-                sys.stdout.flush()
-            # note Update a coarse cluster every leaf_update_fr(default 300) steps.
-            if (iteration - opt.start_leaf_cb_iter) % opt.leaf_update_fr == 0:
-                root_id += 1    # 0 ~ k1-1
-                if root_id > (opt.root_node_num-1):
-                    root_id = 0
+        if not stage1_only:
+            # Stage 2.1: Coarse-level codebook
+            if iteration > opt.start_root_cb_iter and iteration <= opt.start_leaf_cb_iter:
+                cb_mode = "root"
+                if iteration == opt.start_root_cb_iter + 1:
+                    print("[Stage 2.1] Start coarse-level codebook discretization ...")
+                    sys.stdout.flush()
+            elif iteration > opt.start_leaf_cb_iter:
+                cb_mode = "leaf"
+                # Stage 2.2: Fine-level codebook
+                if iteration == opt.start_leaf_cb_iter + 1:
+                    print("[Stage 2.2] Start fine-level codebook discretization ...")
+                    sys.stdout.flush()
+                # note Update a coarse cluster every leaf_update_fr(default 300) steps.
+                if (iteration - opt.start_leaf_cb_iter) % opt.leaf_update_fr == 0:
+                    root_id += 1    # 0 ~ k1-1
+                    if root_id > (opt.root_node_num-1):
+                        root_id = 0
         
         # ###########################################################################
         # [Stage 2]: Two-Level Codebook for Discretization                          #
         #   - Preprocessing: construct pseudo labels (instance features of stage 1) #
         #     Will execute twice, before coarse-level and fine-level clustering     #
         # ###########################################################################
-        if (cb_mode is not None and viewpoint_cam.pesudo_ins_feat is None) or \
-           ((iteration == opt.start_root_cb_iter + 1) or (iteration == opt.start_leaf_cb_iter + 1)):
+        if (not stage1_only) and ((cb_mode is not None and viewpoint_cam.pesudo_ins_feat is None) or \
+           ((iteration == opt.start_root_cb_iter + 1) or (iteration == opt.start_leaf_cb_iter + 1))):
             with torch.no_grad():
                 if cb_mode == "leaf" and cluster_indices is None:
                     cluster_indices = ins_feat_codebook.cls_ids # [num_pts], Coarse-level ID of each point (0 ~ k1-1)
@@ -319,39 +332,41 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         #   - Update codebook                                #
         # ####################################################
         freq_k_means = 200       # coarse-level codebook update frequency
-        if cb_mode == "leaf":
-            freq_k_means = 50    # todo fine-level codebook update frequency
-        if cb_mode is not None:
-            if (iteration % freq_k_means == 1) or iteration == opt.start_root_cb_iter + 1:
-                assign = True   # Reassign cluster centers
-            else:
-                assign = False  #  update cluster centers
-            ins_feat_codebook.forward(gaussians, iteration, assign=assign, \
-                                      mode=cb_mode, selected_leaf=root_id, \
-                                      pos_weight=opt.pos_weight)   # note: position weight
+        if not stage1_only:
+            if cb_mode == "leaf":
+                freq_k_means = 50    # todo fine-level codebook update frequency
+            if cb_mode is not None:
+                if (iteration % freq_k_means == 1) or iteration == opt.start_root_cb_iter + 1:
+                    assign = True   # Reassign cluster centers
+                else:
+                    assign = False  #  update cluster centers
+                ins_feat_codebook.forward(gaussians, iteration, assign=assign, \
+                                          mode=cb_mode, selected_leaf=root_id, \
+                                          pos_weight=opt.pos_weight)   # note: position weight
 
         # render function
         if iteration <= opt.start_ins_feat_iter:    # stage 0
             render_feat=False
             render_cluster=False
-            cluster_indices=None
-        elif iteration > opt.start_leaf_cb_iter:  # stage 2.2 (fine-level)
+            cluster_idx_for_render = None
+        elif (not stage1_only) and iteration > opt.start_leaf_cb_iter:  # stage 2.2 (fine-level)
             render_feat=False   
             render_cluster=True
+            cluster_idx_for_render = cluster_indices
         else:   # stage 1, stage 2.1(coarse-level)
             render_feat=True
             render_cluster=False
-            cluster_indices=None
+            cluster_idx_for_render = None
         # rescale
-        if iteration > opt.start_root_cb_iter:  # stage 2, rescale
+        if (not stage1_only) and iteration > opt.start_root_cb_iter:  # stage 2, rescale
             rescale=True
         else:
             rescale=False
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, iteration,
                             rescale=rescale,                # wherther to re-scale the gaussian scale
-                            cluster_idx=cluster_indices,    # coarse-level cluster id
-                            leaf_cluster_idx=ins_feat_codebook.leaf_cls_ids,    # fine-level cluster id
+                            cluster_idx=cluster_idx_for_render,    # coarse-level cluster id
+                            leaf_cluster_idx=None if ins_feat_codebook is None else ins_feat_codebook.leaf_cls_ids,    # fine-level cluster id
                             render_feat_map=render_feat, 
                             render_cluster=render_cluster,
                             selected_root_id=root_id)       # coarse id (stage 2.2)
@@ -420,7 +435,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         #   - fine-level(leaf) loss computation
         # ####################################################
         # 2.1 coarse-level
-        if cb_mode == "root":   
+        if (not stage1_only) and cb_mode == "root":
             # Only consider valid pixels
             keeped_pix = viewpoint_cam.pesudo_ins_feat.sum(dim=(0)) > 0     # Invalid pixels of pseudo-labels
             keeped_pix = keeped_pix.bool()&rendered_silhouette.bool()       # Empty regions after rescaling
@@ -431,7 +446,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # feat_loss = l2_loss(rendered_ins_feat, viewpoint_cam.pesudo_ins_feat, keeped_pix)
             loss = feat_loss
         # 2.2 fine-level
-        if cb_mode == "leaf" and no_need_bk == False:   
+        if (not stage1_only) and cb_mode == "leaf" and no_need_bk == False:
             total_pix = gt_image.shape[1] * gt_image.shape[2]
             for i in range(len(rendered_cluster_imgs)):
                 cluster_pred = rendered_cluster_imgs[i]
@@ -461,7 +476,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Save the intermediate training results. [OpenGaussian]
         save_intermediate = True
         save_fre = 1000
-        if iteration > opt.start_leaf_cb_iter:
+        if (not stage1_only) and iteration > opt.start_leaf_cb_iter:
             save_fre = 100
         if (iteration % save_fre == 0) and save_intermediate:
             gts_path = os.path.join(scene.model_path, "train_process", "gt")
@@ -539,7 +554,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 sys.stdout.flush()
-                if iteration > opt.start_root_cb_iter:
+                if (not stage1_only) and iteration > opt.start_root_cb_iter:
                     # note: save codebook [OpenGaussian]
                     out_dir = os.path.join(scene.model_path, 'point_cloud/iteration_%d' % iteration)
                     save_kmeans([ins_feat_codebook], ["ins_feat"], out_dir, mode="root")
@@ -578,7 +593,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Stage 3. associate language feature (training-free stage) #
             #   - Performed after training.                             #
             # ###########################################################
-            if iteration == opt.iterations and iteration > opt.start_leaf_cb_iter:
+            if (not stage1_only) and iteration == opt.iterations and iteration > opt.start_leaf_cb_iter:
                 print("[Stage 3] Start 2D language feature - 3D cluster association ...")
                 sys.stdout.flush()
                 if leaf_cluster_indices is None:
