@@ -15,10 +15,11 @@ from __future__ import annotations
 import queue
 import sys
 import threading
+from pathlib import Path
 from typing import Any, Tuple
 
 try:
-    from PySide6.QtCore import Qt, QTimer
+    from PySide6.QtCore import QSettings, Qt, QTimer
     from PySide6.QtGui import QPixmap
     from PySide6.QtWidgets import (
         QApplication,
@@ -55,17 +56,20 @@ try:
 except Exception as exc:
     raise SystemExit(f"Cannot import train_ui backend: {exc}")
 
-
 class TrainQtWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("OpenGaussian Stage1 Trainer (PySide6)")
         self.resize(1280, 860)
+        self._settings = QSettings("OpenGaussian", "TrainQt")
 
         self._queue: queue.Queue[Tuple[str, Any]] = queue.Queue()
         self._start_thread: threading.Thread | None = None
 
         self._build_ui()
+        self._load_ui_settings()
+        if not self.post_lite_input_ply.text().strip():
+            self.on_fill_post_lite_defaults()
 
         self.refresh_timer = QTimer(self)
         self.refresh_timer.setInterval(1200)
@@ -75,6 +79,8 @@ class TrainQtWindow(QMainWindow):
         self._loading_dialog: QDialog | None = None
         self._loading_label: QLabel | None = None
         self._loading_depth = 0
+        self._topdown_render_files: list[str] = []
+        self._topdown_render_idx = 0
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -381,6 +387,150 @@ class TrainQtWindow(QMainWindow):
         post_grid.addWidget(self.post_save_instance_parts, row, 2, 1, 2)
         body_layout.addWidget(post_group)
 
+        post_lite_group = QGroupBox("后处理精简版（Step1语义命名 + Step2实例分割）")
+        post_lite_layout = QVBoxLayout(post_lite_group)
+        self.run_postprocess_lite = QCheckBox("跑后处理精简版")
+        self.post_lite_input_ply = QLineEdit("")
+        self.btn_pick_post_lite_input_ply = QPushButton("选择文件...")
+        self.post_lite_kmeans_dir = QLineEdit("")
+        self.btn_pick_post_lite_kmeans_dir = QPushButton("浏览...")
+        self.post_lite_kmeans_sem_output_dir = QLineEdit("")
+        self.btn_pick_post_lite_kmeans_sem_output_dir = QPushButton("浏览...")
+        self.post_lite_output_subdir = QLineEdit("topdown_instance_pipeline")
+        self.post_lite_num_views = QSpinBox()
+        self.post_lite_num_views.setRange(1, 128)
+        self.post_lite_num_views.setValue(6)
+        self.post_lite_image_size = QSpinBox()
+        self.post_lite_image_size.setRange(256, 4096)
+        self.post_lite_image_size.setSingleStep(128)
+        self.post_lite_image_size.setValue(1024)
+        self.post_lite_fov_deg = QDoubleSpinBox()
+        self.post_lite_fov_deg.setRange(10.0, 170.0)
+        self.post_lite_fov_deg.setSingleStep(1.0)
+        self.post_lite_fov_deg.setValue(58.0)
+        self.post_lite_xoy_step_multiplier = QDoubleSpinBox()
+        self.post_lite_xoy_step_multiplier.setRange(0.2, 5.0)
+        self.post_lite_xoy_step_multiplier.setSingleStep(0.1)
+        self.post_lite_xoy_step_multiplier.setValue(1.0)
+        self.post_lite_semantic_prompts = QLineEdit(
+            "building,vehicle,person,bicycle,vegetation,road,traffic_facility,other"
+        )
+        self.btn_load_post_lite_semantic_prompts = QPushButton("从SAM3读取")
+        self._set_small_path_button(self.btn_load_post_lite_semantic_prompts)
+        self.post_lite_semantic_probe_views = QSpinBox()
+        self.post_lite_semantic_probe_views.setRange(1, 128)
+        self.post_lite_semantic_probe_views.setValue(6)
+        self.post_lite_sam_prompt = QLineEdit("building")
+        self.post_lite_semantic_id = QSpinBox()
+        self.post_lite_semantic_id.setRange(0, 255)
+        self.post_lite_semantic_id.setValue(3)
+        self.post_lite_min_instance_points = QSpinBox()
+        self.post_lite_min_instance_points.setRange(1, 10_000_000)
+        self.post_lite_min_instance_points.setValue(3000)
+        self.post_lite_save_instance_parts = QCheckBox("保存每个实例子PLY")
+        self.post_lite_save_instance_parts.setChecked(True)
+        self.btn_fill_post_lite_defaults = QPushButton("填充建筑默认参数")
+        self.btn_post_lite_render_only = QPushButton("生成渲染图")
+        self.btn_post_lite_continue_instance = QPushButton("基于当前渲染做实例分割")
+        self.btn_post_lite_step1_kmeans_semantic = QPushButton("Step1: kmeans语义重命名")
+        self._set_small_path_button(self.btn_fill_post_lite_defaults)
+        self.post_lite_hint = QLabel("使用上方SAM3权重/设备；scene_path 使用“场景路径”；可单独勾选执行。")
+
+        self._set_small_path_button(self.btn_pick_post_lite_input_ply)
+        self._set_small_path_button(self.btn_pick_post_lite_kmeans_dir)
+        self._set_small_path_button(self.btn_pick_post_lite_kmeans_sem_output_dir)
+
+        post_lite_layout.addWidget(self.run_postprocess_lite)
+        post_lite_layout.addWidget(self.post_lite_hint)
+
+        step1_group = QGroupBox("STEP1：kmeans语义重命名")
+        step1_grid = QGridLayout(step1_group)
+        row = 0
+        step1_grid.addWidget(QLabel("Step1输入kmeans目录"), row, 0)
+        step1_grid.addWidget(self.post_lite_kmeans_dir, row, 1, 1, 2)
+        step1_grid.addWidget(self.btn_pick_post_lite_kmeans_dir, row, 3)
+        row += 1
+        step1_grid.addWidget(QLabel("Step1输出语义目录"), row, 0)
+        step1_grid.addWidget(self.post_lite_kmeans_sem_output_dir, row, 1, 1, 2)
+        step1_grid.addWidget(self.btn_pick_post_lite_kmeans_sem_output_dir, row, 3)
+        row += 1
+        step1_grid.addWidget(QLabel("Step1语义候选"), row, 0)
+        step1_grid.addWidget(self.post_lite_semantic_prompts, row, 1, 1, 2)
+        step1_grid.addWidget(self.btn_load_post_lite_semantic_prompts, row, 3)
+        row += 1
+        step1_grid.addWidget(QLabel("语义探测视角数"), row, 0)
+        step1_grid.addWidget(self.post_lite_semantic_probe_views, row, 1)
+        step1_grid.addWidget(QLabel("俯视视角数"), row, 2)
+        step1_grid.addWidget(self.post_lite_num_views, row, 3)
+        row += 1
+        step1_grid.addWidget(QLabel("渲染分辨率"), row, 0)
+        step1_grid.addWidget(self.post_lite_image_size, row, 1)
+        step1_grid.addWidget(QLabel("FOV(度)"), row, 2)
+        step1_grid.addWidget(self.post_lite_fov_deg, row, 3)
+        row += 1
+        step1_grid.addWidget(QLabel("XOY步长倍率"), row, 0)
+        step1_grid.addWidget(self.post_lite_xoy_step_multiplier, row, 1)
+        step1_grid.addWidget(self.btn_post_lite_step1_kmeans_semantic, row, 2, 1, 2)
+        post_lite_layout.addWidget(step1_group)
+
+        step2_group = QGroupBox("STEP2：俯视渲染 -> SAM3实例 -> 纵向切割")
+        step2_grid = QGridLayout(step2_group)
+        row = 0
+        step2_grid.addWidget(QLabel("输入PLY（为空则按后处理迭代自动取）"), row, 0)
+        step2_grid.addWidget(self.post_lite_input_ply, row, 1, 1, 2)
+        step2_grid.addWidget(self.btn_pick_post_lite_input_ply, row, 3)
+        row += 1
+        step2_grid.addWidget(QLabel("输出子目录"), row, 0)
+        step2_grid.addWidget(self.post_lite_output_subdir, row, 1)
+        step2_grid.addWidget(QLabel("俯视视角数"), row, 2)
+        step2_grid.addWidget(self.post_lite_num_views, row, 3)
+        row += 1
+        step2_grid.addWidget(QLabel("渲染分辨率"), row, 0)
+        step2_grid.addWidget(self.post_lite_image_size, row, 1)
+        step2_grid.addWidget(QLabel("FOV(度)"), row, 2)
+        step2_grid.addWidget(self.post_lite_fov_deg, row, 3)
+        row += 1
+        step2_grid.addWidget(QLabel("XOY步长倍率"), row, 0)
+        step2_grid.addWidget(self.post_lite_xoy_step_multiplier, row, 1)
+        step2_grid.addWidget(QLabel("SAM提示词"), row, 2)
+        step2_grid.addWidget(self.post_lite_sam_prompt, row, 3)
+        row += 1
+        step2_grid.addWidget(QLabel("语义ID"), row, 0)
+        step2_grid.addWidget(self.post_lite_semantic_id, row, 1)
+        step2_grid.addWidget(QLabel("纵向切割最小点数"), row, 2)
+        step2_grid.addWidget(self.post_lite_min_instance_points, row, 3)
+        row += 1
+        step2_grid.addWidget(self.post_lite_save_instance_parts, row, 0, 1, 2)
+        step2_grid.addWidget(self.btn_fill_post_lite_defaults, row, 2, 1, 2)
+        row += 1
+        step2_grid.addWidget(self.btn_post_lite_render_only, row, 0, 1, 2)
+        step2_grid.addWidget(self.btn_post_lite_continue_instance, row, 2, 1, 2)
+        post_lite_layout.addWidget(step2_group)
+        body_layout.addWidget(post_lite_group)
+
+        render_preview_group = QGroupBox("俯视渲染图预览（精简后处理）")
+        render_preview_layout = QVBoxLayout(render_preview_group)
+        render_preview_top = QHBoxLayout()
+        self.btn_refresh_topdown_renders = QPushButton("刷新渲染列表")
+        self.btn_prev_topdown_render = QPushButton("上一张")
+        self.btn_next_topdown_render = QPushButton("下一张")
+        self._set_small_path_button(self.btn_refresh_topdown_renders)
+        self._set_small_path_button(self.btn_prev_topdown_render)
+        self._set_small_path_button(self.btn_next_topdown_render)
+        render_preview_top.addWidget(self.btn_refresh_topdown_renders)
+        render_preview_top.addWidget(self.btn_prev_topdown_render)
+        render_preview_top.addWidget(self.btn_next_topdown_render)
+        render_preview_top.addStretch(1)
+        render_preview_layout.addLayout(render_preview_top)
+        self.topdown_render_status = QLabel("点击“刷新渲染列表”读取 <scene>/<output_subdir>/renders_topdown")
+        render_preview_layout.addWidget(self.topdown_render_status)
+        self.topdown_render_preview = QLabel("渲染图预览")
+        self.topdown_render_preview.setAlignment(Qt.AlignCenter)
+        self.topdown_render_preview.setMinimumSize(520, 320)
+        self.topdown_render_preview.setStyleSheet("border: 1px solid #D4D7DE; background: #F7F9FC;")
+        render_preview_layout.addWidget(self.topdown_render_preview)
+        body_layout.addWidget(render_preview_group)
+
         action_group = QGroupBox("操作")
         action_layout = QHBoxLayout(action_group)
         self.btn_preview = QPushButton("预览命令")
@@ -454,6 +604,7 @@ class TrainQtWindow(QMainWindow):
         self.btn_start.clicked.connect(self.on_start)
         self.btn_stop.clicked.connect(self.on_stop)
         self.btn_refresh.clicked.connect(self.on_manual_refresh)
+        self.log_text.selectionChanged.connect(self._on_log_selection_changed)
         self.btn_pick_source_path.clicked.connect(
             lambda: self._pick_directory(self.source_path, "选择场景目录")
         )
@@ -490,9 +641,25 @@ class TrainQtWindow(QMainWindow):
         self.btn_pick_instance_mask_dir.clicked.connect(
             lambda: self._pick_directory(self.post_instance_mask_dir, "选择实例mask目录")
         )
+        self.btn_pick_post_lite_input_ply.clicked.connect(
+            lambda: self._pick_file(self.post_lite_input_ply, "选择精简版输入 PLY", "PLY Files (*.ply);;All Files (*)")
+        )
+        self.btn_pick_post_lite_kmeans_dir.clicked.connect(
+            lambda: self._pick_directory(self.post_lite_kmeans_dir, "选择Step1输入kmeans目录")
+        )
+        self.btn_pick_post_lite_kmeans_sem_output_dir.clicked.connect(
+            lambda: self._pick_directory(self.post_lite_kmeans_sem_output_dir, "选择Step1输出语义目录")
+        )
+        self.btn_fill_post_lite_defaults.clicked.connect(self.on_fill_post_lite_defaults)
+        self.btn_load_post_lite_semantic_prompts.clicked.connect(self.on_load_post_lite_semantic_prompts)
+        self.btn_post_lite_render_only.clicked.connect(self.on_post_lite_render_only)
+        self.btn_post_lite_continue_instance.clicked.connect(self.on_post_lite_continue_instance)
+        self.btn_post_lite_step1_kmeans_semantic.clicked.connect(self.on_post_lite_step1_kmeans_semantic)
+        self.btn_refresh_topdown_renders.clicked.connect(self.on_refresh_topdown_renders)
+        self.btn_prev_topdown_render.clicked.connect(self.on_prev_topdown_render)
+        self.btn_next_topdown_render.clicked.connect(self.on_next_topdown_render)
         self.btn_refresh_ins_feat.clicked.connect(self.on_refresh_ins_feat)
         self.btn_load_id2label.clicked.connect(self.on_load_id2label)
-
         self.setStyleSheet(
             """
             QWidget { font-size: 13px; }
@@ -541,6 +708,55 @@ class TrainQtWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, title, start, file_filter)
         if path:
             target.setText(path)
+
+    def _load_ui_settings(self) -> None:
+        keys = {
+            "python_exec": self.python_exec,
+            "source_path": self.source_path,
+            "model_path": self.model_path,
+            "start_checkpoint": self.start_checkpoint,
+            "sam3_input_dir": self.sam3_input_dir,
+            "sam3_output_dir": self.sam3_output_dir,
+            "sam3_checkpoint": self.sam3_checkpoint,
+            "post_input_ply": self.post_input_ply,
+            "post_cluster_output_dir": self.post_cluster_output_dir,
+            "post_sem_output_dir": self.post_sem_output_dir,
+            "post_instance_output_dir": self.post_instance_output_dir,
+            "post_mask2inst_output_dir": self.post_mask2inst_output_dir,
+            "post_instance_mask_dir": self.post_instance_mask_dir,
+            "post_lite_input_ply": self.post_lite_input_ply,
+            "post_lite_kmeans_dir": self.post_lite_kmeans_dir,
+            "post_lite_kmeans_sem_output_dir": self.post_lite_kmeans_sem_output_dir,
+            "post_lite_output_subdir": self.post_lite_output_subdir,
+        }
+        for key, widget in keys.items():
+            val = self._settings.value(f"ui/{key}", "", str)
+            if val:
+                widget.setText(val)
+
+    def _save_ui_settings(self) -> None:
+        keys = {
+            "python_exec": self.python_exec,
+            "source_path": self.source_path,
+            "model_path": self.model_path,
+            "start_checkpoint": self.start_checkpoint,
+            "sam3_input_dir": self.sam3_input_dir,
+            "sam3_output_dir": self.sam3_output_dir,
+            "sam3_checkpoint": self.sam3_checkpoint,
+            "post_input_ply": self.post_input_ply,
+            "post_cluster_output_dir": self.post_cluster_output_dir,
+            "post_sem_output_dir": self.post_sem_output_dir,
+            "post_instance_output_dir": self.post_instance_output_dir,
+            "post_mask2inst_output_dir": self.post_mask2inst_output_dir,
+            "post_instance_mask_dir": self.post_instance_mask_dir,
+            "post_lite_input_ply": self.post_lite_input_ply,
+            "post_lite_kmeans_dir": self.post_lite_kmeans_dir,
+            "post_lite_kmeans_sem_output_dir": self.post_lite_kmeans_sem_output_dir,
+            "post_lite_output_subdir": self.post_lite_output_subdir,
+        }
+        for key, widget in keys.items():
+            self._settings.setValue(f"ui/{key}", widget.text().strip())
+        self._settings.sync()
 
     def _collect_args(self) -> Tuple[Any, ...]:
         run_post = bool(self.run_postprocess.isChecked())
@@ -601,6 +817,19 @@ class TrainQtWindow(QMainWindow):
             int(self.post_instance_min_point_votes.value()),
             int(self.post_min_instance_points.value()),
             bool(self.post_save_instance_parts.isChecked()),
+            bool(self.run_postprocess_lite.isChecked()),
+            self.post_lite_input_ply.text().strip(),
+            self.post_lite_output_subdir.text().strip(),
+            int(self.post_lite_num_views.value()),
+            int(self.post_lite_image_size.value()),
+            float(self.post_lite_fov_deg.value()),
+            float(self.post_lite_xoy_step_multiplier.value()),
+            self.post_lite_semantic_prompts.text().strip(),
+            int(self.post_lite_semantic_probe_views.value()),
+            self.post_lite_sam_prompt.text().strip(),
+            int(self.post_lite_semantic_id.value()),
+            int(self.post_lite_min_instance_points.value()),
+            bool(self.post_lite_save_instance_parts.isChecked()),
         )
 
     def _show_loading(self, text: str) -> None:
@@ -660,11 +889,18 @@ class TrainQtWindow(QMainWindow):
         ratio = float(old_val) / float(old_max)
         bar.setValue(int(round(ratio * new_max)))
 
+    def _has_log_selection(self) -> bool:
+        return bool(self.log_text.textCursor().hasSelection())
+
+    def _on_log_selection_changed(self) -> None:
+        return
+
     def _apply_refresh(
-        self, status: str, logs: str, progress: float, current_iter: int, monitor: str
+        self, status: str, logs: str, progress: float, current_iter: int, monitor: str, update_logs: bool = True
     ) -> None:
         self.status_label.setText(status)
-        self._set_text_preserve_scroll(self.log_text, logs)
+        if update_logs:
+            self._set_text_preserve_scroll(self.log_text, logs)
         self.progress.setValue(max(0, min(1000, int(float(progress) * 10))))
         self.iter_label.setText(str(int(current_iter)))
         self.monitor_label.setText(monitor.replace("\n", " | "))
@@ -725,6 +961,149 @@ class TrainQtWindow(QMainWindow):
             lambda: backend.detect_id2label_from_language_features(path_mode, source_path),
         )
 
+    def on_fill_post_lite_defaults(self) -> None:
+        self.source_path.setText("D:\\Scene_0325")
+        self.model_path.setText("D:\\Scene_0325\\test0325")
+        self.post_iteration.setValue(30000)
+        self.post_lite_input_ply.setText("D:\\Scene_0325\\test0325\\kmeans_3\\class0.ply")
+        self.post_lite_kmeans_dir.setText("D:\\Scene_0325\\test0402\\point_cloud\\iteration_31000\\kmeans_5")
+        self.post_lite_kmeans_sem_output_dir.setText("D:\\Scene_0325\\test0402\\point_cloud\\iteration_31000\\kmeans_5\\semantic_named")
+        self.post_lite_output_subdir.setText("topdown_instance_pipeline")
+        self.post_lite_num_views.setValue(6)
+        self.post_lite_image_size.setValue(1024)
+        self.post_lite_fov_deg.setValue(58.0)
+        self.post_lite_xoy_step_multiplier.setValue(1.0)
+        self.post_lite_semantic_prompts.setText("auto")
+        self.post_lite_semantic_probe_views.setValue(6)
+        self.post_lite_sam_prompt.setText("building")
+        self.post_lite_semantic_id.setValue(3)
+        self.post_lite_min_instance_points.setValue(3000)
+        self.post_lite_save_instance_parts.setChecked(True)
+        self.sam3_device.setCurrentText("cuda")
+        if not self.sam3_checkpoint.text().strip():
+            self.sam3_checkpoint.setText(str(backend.SAM3_DEFAULT_CKPT))
+
+    def _topdown_render_dir(self) -> Path:
+        scene_path = backend.normalize_path(self.source_path.text().strip(), mode=self._current_path_mode())
+        subdir = (self.post_lite_output_subdir.text() or "topdown_instance_pipeline").strip()
+        return Path(scene_path) / subdir / "renders_topdown"
+
+    def _show_topdown_render_current(self) -> None:
+        if not self._topdown_render_files:
+            self._set_image_preview(self.topdown_render_preview, None, "暂无渲染图")
+            self.topdown_render_status.setText(f"未找到渲染图：{self._topdown_render_dir()}")
+            return
+        self._topdown_render_idx = max(0, min(self._topdown_render_idx, len(self._topdown_render_files) - 1))
+        p = self._topdown_render_files[self._topdown_render_idx]
+        self._set_image_preview(self.topdown_render_preview, p, "渲染图加载失败")
+        self.topdown_render_status.setText(
+            f"{self._topdown_render_idx + 1}/{len(self._topdown_render_files)} | {p}"
+        )
+
+    def on_refresh_topdown_renders(self) -> None:
+        render_dir = self._topdown_render_dir()
+        exts = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+        files = []
+        if render_dir.exists():
+            for p in sorted(render_dir.iterdir()):
+                if p.is_file() and p.suffix.lower() in exts:
+                    files.append(str(p))
+        self._topdown_render_files = files
+        self._topdown_render_idx = 0
+        self._show_topdown_render_current()
+
+    def on_prev_topdown_render(self) -> None:
+        if not self._topdown_render_files:
+            self.on_refresh_topdown_renders()
+            return
+        self._topdown_render_idx = (self._topdown_render_idx - 1) % len(self._topdown_render_files)
+        self._show_topdown_render_current()
+
+    def on_next_topdown_render(self) -> None:
+        if not self._topdown_render_files:
+            self.on_refresh_topdown_renders()
+            return
+        self._topdown_render_idx = (self._topdown_render_idx + 1) % len(self._topdown_render_files)
+        self._show_topdown_render_current()
+
+    def _collect_post_lite_runner_args(self) -> Tuple[Any, ...]:
+        return (
+            self.python_exec.text().strip(),
+            self._current_path_mode(),
+            self.source_path.text().strip(),
+            self.model_path.text().strip(),
+            int(self.post_iteration.value()),
+            self.post_lite_input_ply.text().strip(),
+            self.post_lite_output_subdir.text().strip(),
+            int(self.post_lite_num_views.value()),
+            int(self.post_lite_image_size.value()),
+            float(self.post_lite_fov_deg.value()),
+            float(self.post_lite_xoy_step_multiplier.value()),
+            self.post_lite_semantic_prompts.text().strip(),
+            int(self.post_lite_semantic_probe_views.value()),
+            self.post_lite_sam_prompt.text().strip(),
+            int(self.post_lite_semantic_id.value()),
+            int(self.post_lite_min_instance_points.value()),
+            bool(self.post_lite_save_instance_parts.isChecked()),
+            self.sam3_checkpoint.text().strip(),
+            self.sam3_device.currentText().strip(),
+        )
+
+    def _collect_post_lite_step1_args(self) -> Tuple[Any, ...]:
+        return (
+            self.python_exec.text().strip(),
+            self._current_path_mode(),
+            self.source_path.text().strip(),
+            self.post_lite_kmeans_dir.text().strip(),
+            self.post_lite_kmeans_sem_output_dir.text().strip(),
+            self.post_lite_semantic_prompts.text().strip(),
+            int(self.post_lite_semantic_probe_views.value()),
+            int(self.post_lite_num_views.value()),
+            int(self.post_lite_image_size.value()),
+            float(self.post_lite_fov_deg.value()),
+            float(self.post_lite_xoy_step_multiplier.value()),
+            self.sam3_checkpoint.text().strip(),
+            self.sam3_device.currentText().strip(),
+            (self.post_lite_sam_prompt.text().strip() or "building"),
+        )
+
+    def on_post_lite_render_only(self) -> None:
+        args = self._collect_post_lite_runner_args()
+        self._run_async_with_loading(
+            "post_lite_render_only",
+            "正在生成俯视渲染图...",
+            lambda: backend.run_postprocess_lite_split(*args, mode="render_only"),
+        )
+
+    def on_post_lite_continue_instance(self) -> None:
+        args = self._collect_post_lite_runner_args()
+        selected_image = "all"
+        self._run_async_with_loading(
+            "post_lite_continue_instance",
+            "正在基于当前渲染继续实例分割...",
+            lambda: backend.run_postprocess_lite_split(
+                *args, mode="instance_from_renders", post_lite_mask_image=selected_image
+            ),
+        )
+
+    def on_post_lite_step1_kmeans_semantic(self) -> None:
+        args = self._collect_post_lite_step1_args()
+        self._run_async_with_loading(
+            "post_lite_step1_kmeans_semantic",
+            "正在执行Step1: kmeans语义重命名...",
+            lambda: backend.run_postprocess_lite_step1_kmeans_semantic(*args),
+        )
+
+    def on_load_post_lite_semantic_prompts(self) -> None:
+        path_mode = self._current_path_mode()
+        source_path = self.source_path.text().strip()
+        fallback = self.post_lite_sam_prompt.text().strip() or "building"
+        self._run_async_with_loading(
+            "load_post_lite_sem_prompts",
+            "正在从SAM3/语言特征读取语义候选...",
+            lambda: backend.detect_semantic_prompts_for_lite(path_mode, source_path, fallback),
+        )
+
     def _on_tick(self) -> None:
         while True:
             try:
@@ -734,7 +1113,9 @@ class TrainQtWindow(QMainWindow):
             if kind == "start_ok":
                 status, logs, cmd, progress, current_iter, monitor = data
                 self.command_text.setPlainText(cmd)
-                self._apply_refresh(status, logs, progress, current_iter, monitor)
+                self._apply_refresh(
+                    status, logs, progress, current_iter, monitor, update_logs=(not self._has_log_selection())
+                )
                 self.btn_start.setEnabled(True)
             elif kind == "start_err":
                 self.btn_start.setEnabled(True)
@@ -748,7 +1129,9 @@ class TrainQtWindow(QMainWindow):
             elif kind == "manual_refresh_ok":
                 self._end_loading()
                 status, logs, progress, current_iter, monitor = data
-                self._apply_refresh(status, logs, progress, current_iter, monitor)
+                self._apply_refresh(
+                    status, logs, progress, current_iter, monitor, update_logs=(not self._has_log_selection())
+                )
             elif kind == "manual_refresh_err":
                 self._end_loading()
                 QMessageBox.critical(self, "刷新失败", str(data))
@@ -772,12 +1155,54 @@ class TrainQtWindow(QMainWindow):
             elif kind == "load_id2label_err":
                 self._end_loading()
                 self.post_id2label_status.setText(f"读取失败: {data}")
+            elif kind == "post_lite_render_only_ok":
+                self._end_loading()
+                status, logs = data
+                self._set_text_preserve_scroll(self.log_text, str(logs))
+                self.topdown_render_status.setText(f"渲染流程{status}，已刷新预览")
+                self.on_refresh_topdown_renders()
+            elif kind == "post_lite_render_only_err":
+                self._end_loading()
+                QMessageBox.critical(self, "生成渲染图失败", str(data))
+            elif kind == "post_lite_continue_instance_ok":
+                self._end_loading()
+                status, logs = data
+                self._set_text_preserve_scroll(self.log_text, str(logs))
+                self.topdown_render_status.setText(f"实例分割流程{status}")
+            elif kind == "post_lite_continue_instance_err":
+                self._end_loading()
+                QMessageBox.critical(self, "实例分割失败", str(data))
+            elif kind == "post_lite_step1_kmeans_semantic_ok":
+                self._end_loading()
+                status, logs = data
+                self._set_text_preserve_scroll(self.log_text, str(logs))
+                self.topdown_render_status.setText(f"Step1语义重命名{status}")
+            elif kind == "post_lite_step1_kmeans_semantic_err":
+                self._end_loading()
+                QMessageBox.critical(self, "Step1失败", str(data))
+            elif kind == "load_post_lite_sem_prompts_ok":
+                self._end_loading()
+                val = str(data or "").strip()
+                if val:
+                    self.post_lite_semantic_prompts.setText(val)
+                    self.topdown_render_status.setText("Step1语义候选已从SAM3结果更新")
+                else:
+                    self.topdown_render_status.setText("未读取到语义候选，保留当前值")
+            elif kind == "load_post_lite_sem_prompts_err":
+                self._end_loading()
+                QMessageBox.critical(self, "读取语义候选失败", str(data))
 
         try:
             status, logs, progress, current_iter, monitor = backend.refresh_logs()
-            self._apply_refresh(status, logs, progress, current_iter, monitor)
+            self._apply_refresh(
+                status, logs, progress, current_iter, monitor, update_logs=(not self._has_log_selection())
+            )
         except Exception:
             pass
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._save_ui_settings()
+        super().closeEvent(event)
 
 
 def main() -> None:

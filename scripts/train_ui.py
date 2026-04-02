@@ -78,10 +78,15 @@ KMEANS_SCRIPT = ROOT_DIR / "scripts" / "cluster_semantic_kmeans.py"
 SEMANTIC_PIPELINE_SCRIPT = ROOT_DIR / "scripts" / "semantic_instance_pipeline.py"
 SEMANTIC_INSTANCE_SCRIPT = ROOT_DIR / "scripts" / "semantic_models_seg3d_instance.py"
 SEMANTIC_TO_INSTANCE_CC_SCRIPT = ROOT_DIR / "scripts" / "semantic_to_instance_cc.py"
+TOPDOWN_PIPELINE_SCRIPT = ROOT_DIR / "scripts" / "topdown_sam3_instance_pipeline.py"
+TOPDOWN_COLUMNCUT_SCRIPT = ROOT_DIR / "scripts" / "topdown_column_cut_instance.py"
 WSL_POWERSHELL = Path("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
 SAM3_PY = Path("/mnt/d/sam3/.conda/envs/sam3/bin/python")
 SAM3_SCRIPT = Path("/mnt/d/sam3/sam3/scripts/batch_sam3_dji_masks.py")
+SAM3_IMAGE_SCRIPT = ROOT_DIR / "scripts" / "sam3_instance_from_images.py"
+STEP1_KMEANS_SEM_SCRIPT = ROOT_DIR / "scripts" / "step1_kmeans_semantic_rename.py"
 SAM3_DEFAULT_CKPT = Path("/mnt/c/Users/ysy/.cache/modelscope/hub/models/facebook/sam3/sam3.pt")
+DEFAULT_LITE_XY_JITTER_BASE = 0.22
 
 DEFAULT_ID2LABEL: Dict[int, str] = {
     0: "background",
@@ -245,6 +250,48 @@ def detect_id2label_from_language_features(path_mode: str, source_path: str) -> 
     for cid in ids:
         mapping[cid] = DEFAULT_ID2LABEL.get(cid, f"class_{cid}")
     return format_id2label_text(mapping)
+
+
+def detect_semantic_prompts_for_lite(path_mode: str, source_path: str, fallback_prompt: str = "building") -> str:
+    scene_path = Path(normalize_path(source_path, mode=path_mode))
+
+    prompts: List[str] = []
+    try:
+        txt = detect_id2label_from_language_features(path_mode, source_path)
+        if txt:
+            mapping = parse_id2label_text(txt)
+            for k in sorted(mapping.keys()):
+                name = str(mapping[k]).strip()
+                if not name:
+                    continue
+                if int(k) == 0 or name.lower() in {"background", "bg"}:
+                    continue
+                prompts.append(name)
+    except Exception:
+        pass
+
+    if not prompts:
+        pri = _load_sam3_priority(scene_path)
+        for s in pri:
+            t = str(s).strip()
+            if t and t.lower() not in {"background", "bg"}:
+                prompts.append(t)
+
+    # de-duplicate while preserving order
+    dedup: List[str] = []
+    seen: set[str] = set()
+    for p in prompts:
+        key = p.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(p)
+
+    if not dedup:
+        fb = (fallback_prompt or "building").strip()
+        if fb:
+            dedup = [fb]
+    return ",".join(dedup)
 
 
 def sync_id2label_for_ui(path_mode: str, source_path: str, current_id2label: str, auto_sync: bool) -> str:
@@ -871,6 +918,198 @@ def build_postprocess_commands(
     return steps, meta
 
 
+def build_postprocess_lite_commands(
+    python_exec: str,
+    path_mode: str,
+    source_path: str,
+    model_path: str,
+    post_iteration: int,
+    post_lite_input_ply: str,
+    post_lite_output_subdir: str,
+    post_lite_num_views: int,
+    post_lite_image_size: int,
+    post_lite_fov_deg: float,
+    post_lite_xoy_step_multiplier: float,
+    post_lite_semantic_prompts: str,
+    post_lite_semantic_probe_views: int,
+    post_lite_sam_prompt: str,
+    post_lite_semantic_id: int,
+    post_lite_min_instance_points: int,
+    post_lite_save_instance_parts: bool,
+    sam3_checkpoint: str,
+    sam3_device: str,
+    post_lite_mask_image: str = "auto",
+) -> Tuple[List[Tuple[str, List[str]]], Dict[str, str]]:
+    py = (python_exec or "").strip() or "python"
+    scene_path = normalize_path(source_path, mode=path_mode)
+    model_path_norm = normalize_path(model_path, mode=path_mode)
+
+    input_ply = (
+        normalize_path(post_lite_input_ply, mode=path_mode)
+        if (post_lite_input_ply or "").strip()
+        else str(Path(model_path_norm) / "point_cloud" / f"iteration_{int(post_iteration)}" / "point_cloud.ply")
+    )
+    output_subdir = (post_lite_output_subdir or "topdown_instance_pipeline").strip()
+    sam3_ckpt_norm = (
+        normalize_path(sam3_checkpoint, mode=path_mode)
+        if (sam3_checkpoint or "").strip()
+        else str(SAM3_DEFAULT_CKPT)
+    )
+    pipe_root = str(Path(scene_path) / output_subdir)
+    render_dir = str(Path(pipe_root) / "renders_topdown")
+    semantic_probe_dir = str(Path(pipe_root) / "semantic_probe")
+    semantic_probe_summary = str(Path(semantic_probe_dir) / "summary.json")
+    pose_json = str(Path(scene_path) / "render_view_poses_topdown" / "topdown_camera_poses.json")
+    instance_mask_dir = str(Path(pipe_root) / "sam3_instance" / "instance_index_npy")
+    column_out_dir = str(Path(pipe_root) / "instance_3d_columncut")
+
+    xy_jitter_ratio = max(0.0, min(1.0, float(DEFAULT_LITE_XY_JITTER_BASE) * float(post_lite_xoy_step_multiplier)))
+
+    step1_cmd = [
+        py,
+        str(TOPDOWN_PIPELINE_SCRIPT),
+        "--scene_path",
+        scene_path,
+        "--input_ply",
+        input_ply,
+        "--output_subdir",
+        output_subdir,
+        "--num_views",
+        str(int(post_lite_num_views)),
+        "--image_size",
+        str(int(post_lite_image_size)),
+        "--fov_deg",
+        str(float(post_lite_fov_deg)),
+        "--xy_jitter_ratio",
+        str(float(xy_jitter_ratio)),
+        "--sam3_python",
+        str(SAM3_PY),
+        "--sam3_checkpoint",
+        sam3_ckpt_norm,
+        "--sam3_device",
+        sam3_device if sam3_device in {"cuda", "cpu"} else "cuda",
+        "--sam3_prompts",
+        (post_lite_sam_prompt or "building").strip(),
+        "--semantic_id",
+        str(int(post_lite_semantic_id)),
+        "--render_only",
+    ]
+
+    step2_cmd = [
+        py,
+        str(TOPDOWN_PIPELINE_SCRIPT),
+        "--scene_path",
+        scene_path,
+        "--input_ply",
+        input_ply,
+        "--output_subdir",
+        output_subdir,
+        "--num_views",
+        str(int(post_lite_num_views)),
+        "--image_size",
+        str(int(post_lite_image_size)),
+        "--fov_deg",
+        str(float(post_lite_fov_deg)),
+        "--xy_jitter_ratio",
+        str(float(xy_jitter_ratio)),
+        "--sam3_python",
+        str(SAM3_PY),
+        "--sam3_checkpoint",
+        sam3_ckpt_norm,
+        "--sam3_device",
+        sam3_device if sam3_device in {"cuda", "cpu"} else "cuda",
+        "--sam3_prompts",
+        (post_lite_sam_prompt or "building").strip(),
+        "--semantic_id",
+        str(int(post_lite_semantic_id)),
+        "--skip_render",
+        "--semantic_probe_summary",
+        semantic_probe_summary,
+        "--semantic_probe_fallback_prompts",
+        (post_lite_sam_prompt or "building").strip(),
+    ]
+    if post_lite_save_instance_parts:
+        step2_cmd.append("--save_instance_parts")
+
+    semantic_prompts = (post_lite_semantic_prompts or "").strip()
+    if (not semantic_prompts) or semantic_prompts.lower() == "auto":
+        semantic_prompts = detect_semantic_prompts_for_lite(
+            path_mode=path_mode,
+            source_path=source_path,
+            fallback_prompt=(post_lite_sam_prompt or "building").strip(),
+        )
+    step_probe_cmd = [
+        str(SAM3_PY),
+        str(SAM3_IMAGE_SCRIPT),
+        "--input-dir",
+        render_dir,
+        "--output-dir",
+        semantic_probe_dir,
+        "--device",
+        sam3_device if sam3_device in {"cuda", "cpu"} else "cuda",
+        "--resolution",
+        "1008",
+        "--confidence-threshold",
+        "0.35",
+        "--prompts",
+        semantic_prompts,
+        "--min-mask-area",
+        "40",
+        "--checkpoint-path",
+        sam3_ckpt_norm,
+        "--no-hf-download",
+    ]
+    if int(post_lite_semantic_probe_views) > 0:
+        step_probe_cmd.extend(["--max-images", str(int(post_lite_semantic_probe_views))])
+
+    step3_cmd = [
+        py,
+        str(TOPDOWN_COLUMNCUT_SCRIPT),
+        "--input_ply",
+        input_ply,
+        "--pose_json",
+        pose_json,
+        "--instance_mask_dir",
+        instance_mask_dir,
+        "--output_dir",
+        column_out_dir,
+        "--semantic_id",
+        str(int(post_lite_semantic_id)),
+        "--mode",
+        "all_views_fused",
+        "--fused_instance_npy",
+        str(Path(pipe_root) / "instance_3d" / "point_instance_id.npy"),
+        "--mask_image",
+        (post_lite_mask_image or "auto").strip(),
+        "--xoy_stride_multiplier",
+        str(float(post_lite_xoy_step_multiplier)),
+        "--min_instance_points",
+        str(int(post_lite_min_instance_points)),
+    ]
+    if post_lite_save_instance_parts:
+        step3_cmd.append("--save_instance_parts")
+
+    steps = [
+        ("post-lite-render-only", step1_cmd),
+        ("post-lite-semantic-probe", step_probe_cmd),
+        ("post-lite-instance-from-renders", step2_cmd),
+        ("post-lite-column-cut", step3_cmd),
+    ]
+    meta = {
+        "scene_path": scene_path,
+        "model_path": model_path_norm,
+        "input_ply": input_ply,
+        "pipeline_root": pipe_root,
+        "render_dir": render_dir,
+        "semantic_probe_dir": semantic_probe_dir,
+        "semantic_probe_summary": semantic_probe_summary,
+        "pose_json": pose_json,
+        "instance_mask_dir": instance_mask_dir,
+        "column_out_dir": column_out_dir,
+    }
+    return steps, meta
+
+
 def run_blocking_with_logs(cmd: List[str], prefix: str, track_side_process: bool = False) -> int:
     proc = subprocess.Popen(
         cmd,
@@ -910,6 +1149,133 @@ def run_postprocess_steps(post_steps: List[Tuple[str, List[str]]]) -> bool:
     if ok:
         STATE.append("[launcher] 后处理完成")
     return ok
+
+
+def run_postprocess_lite_split(
+    python_exec: str,
+    path_mode: str,
+    source_path: str,
+    model_path: str,
+    post_iteration: int,
+    post_lite_input_ply: str,
+    post_lite_output_subdir: str,
+    post_lite_num_views: int,
+    post_lite_image_size: int,
+    post_lite_fov_deg: float,
+    post_lite_xoy_step_multiplier: float,
+    post_lite_semantic_prompts: str,
+    post_lite_semantic_probe_views: int,
+    post_lite_sam_prompt: str,
+    post_lite_semantic_id: int,
+    post_lite_min_instance_points: int,
+    post_lite_save_instance_parts: bool,
+    sam3_checkpoint: str,
+    sam3_device: str,
+    mode: str,
+    post_lite_mask_image: str = "auto",
+) -> Tuple[str, str]:
+    if STATE.is_running():
+        return "训练或后处理正在运行", STATE.tail()
+    if mode not in {"render_only", "instance_from_renders"}:
+        return f"未知模式: {mode}", STATE.tail()
+
+    lite_steps, _ = build_postprocess_lite_commands(
+        python_exec=python_exec,
+        path_mode=path_mode,
+        source_path=source_path,
+        model_path=model_path,
+        post_iteration=int(post_iteration),
+        post_lite_input_ply=post_lite_input_ply,
+        post_lite_output_subdir=post_lite_output_subdir,
+        post_lite_num_views=int(post_lite_num_views),
+        post_lite_image_size=int(post_lite_image_size),
+        post_lite_fov_deg=float(post_lite_fov_deg),
+        post_lite_xoy_step_multiplier=float(post_lite_xoy_step_multiplier),
+        post_lite_semantic_prompts=post_lite_semantic_prompts,
+        post_lite_semantic_probe_views=int(post_lite_semantic_probe_views),
+        post_lite_sam_prompt=post_lite_sam_prompt,
+        post_lite_semantic_id=int(post_lite_semantic_id),
+        post_lite_min_instance_points=int(post_lite_min_instance_points),
+        post_lite_save_instance_parts=bool(post_lite_save_instance_parts),
+        sam3_checkpoint=sam3_checkpoint,
+        sam3_device=sam3_device,
+        post_lite_mask_image=post_lite_mask_image,
+    )
+    if mode == "render_only":
+        steps = lite_steps[:1]
+        STATE.append("[launcher] 运行精简后处理: 仅生成渲染图")
+    else:
+        steps = lite_steps[1:]
+        STATE.append("[launcher] 运行精简后处理: 基于当前渲染继续实例分割")
+    ok = run_postprocess_steps(steps)
+    return ("完成" if ok else "失败"), STATE.tail()
+
+
+def run_postprocess_lite_step1_kmeans_semantic(
+    python_exec: str,
+    path_mode: str,
+    source_path: str,
+    post_lite_kmeans_dir: str,
+    post_lite_kmeans_sem_output_dir: str,
+    post_lite_semantic_prompts: str,
+    post_lite_semantic_probe_views: int,
+    post_lite_num_views: int,
+    post_lite_image_size: int,
+    post_lite_fov_deg: float,
+    post_lite_xoy_step_multiplier: float,
+    sam3_checkpoint: str,
+    sam3_device: str,
+    fallback_prompt: str = "building",
+) -> Tuple[str, str]:
+    if STATE.is_running():
+        return "训练或后处理正在运行", STATE.tail()
+
+    scene_path = normalize_path(source_path, mode=path_mode)
+    kmeans_dir = normalize_path(post_lite_kmeans_dir, mode=path_mode)
+    out_dir = normalize_path(post_lite_kmeans_sem_output_dir, mode=path_mode)
+    if not out_dir.strip():
+        out_dir = str(Path(kmeans_dir) / "semantic_named")
+
+    prompts = (post_lite_semantic_prompts or "").strip()
+    if (not prompts) or prompts.lower() == "auto":
+        prompts = detect_semantic_prompts_for_lite(path_mode, source_path, fallback_prompt=fallback_prompt)
+
+    xy_jitter_ratio = max(0.0, min(1.0, float(DEFAULT_LITE_XY_JITTER_BASE) * float(post_lite_xoy_step_multiplier)))
+    ckpt = normalize_path(sam3_checkpoint, mode=path_mode) if (sam3_checkpoint or "").strip() else str(SAM3_DEFAULT_CKPT)
+
+    cmd = [
+        (python_exec or "").strip() or "python",
+        str(STEP1_KMEANS_SEM_SCRIPT),
+        "--scene_path",
+        scene_path,
+        "--kmeans_dir",
+        kmeans_dir,
+        "--output_dir",
+        out_dir,
+        "--python_exec",
+        (python_exec or "").strip() or "python",
+        "--sam3_python",
+        str(SAM3_PY),
+        "--sam3_checkpoint",
+        ckpt,
+        "--sam3_device",
+        sam3_device if sam3_device in {"cuda", "cpu"} else "cuda",
+        "--semantic_prompts",
+        prompts,
+        "--semantic_probe_views",
+        str(int(post_lite_semantic_probe_views)),
+        "--num_views",
+        str(int(post_lite_num_views)),
+        "--image_size",
+        str(int(post_lite_image_size)),
+        "--fov_deg",
+        str(float(post_lite_fov_deg)),
+        "--xy_jitter_ratio",
+        str(float(xy_jitter_ratio)),
+    ]
+
+    ok = run_postprocess_steps([("post-lite-step1-kmeans-semantic", cmd)])
+    return ("完成" if ok else "失败"), STATE.tail()
 
 
 def export_sam3_to_language_features(path_mode: str, source_path: str, sam3_output_dir: str) -> int:
@@ -1030,9 +1396,22 @@ def preview_command(
     post_instance_min_point_votes: int,
     post_min_instance_points: int,
     post_save_instance_parts: bool,
+    run_postprocess_lite: bool = False,
+    post_lite_input_ply: str = "",
+    post_lite_output_subdir: str = "topdown_instance_pipeline",
+    post_lite_num_views: int = 6,
+    post_lite_image_size: int = 1024,
+    post_lite_fov_deg: float = 58.0,
+    post_lite_xoy_step_multiplier: float = 1.0,
+    post_lite_semantic_prompts: str = "building,vehicle,person,bicycle,vegetation,road,traffic_facility,other",
+    post_lite_semantic_probe_views: int = 6,
+    post_lite_sam_prompt: str = "building",
+    post_lite_semantic_id: int = 3,
+    post_lite_min_instance_points: int = 3000,
+    post_lite_save_instance_parts: bool = True,
 ):
-    if not run_sam3 and not run_training and not run_postprocess:
-        return "请至少勾选一个流程：跑SAM3 / 跑训练 / 跑后处理"
+    if not run_sam3 and not run_training and not run_postprocess and not run_postprocess_lite:
+        return "请至少勾选一个流程：跑SAM3 / 跑训练 / 跑后处理 / 跑后处理精简版"
 
     train_cmd = build_command(
         python_exec,
@@ -1147,6 +1526,52 @@ def preview_command(
                 cmd_lines.append(shell_join(c))
             blocks.append("[POST]\n" + "\n".join(cmd_lines))
 
+    if run_postprocess_lite:
+        missing_scripts: List[str] = []
+        if not TOPDOWN_PIPELINE_SCRIPT.exists():
+            missing_scripts.append(str(TOPDOWN_PIPELINE_SCRIPT))
+        if not TOPDOWN_COLUMNCUT_SCRIPT.exists():
+            missing_scripts.append(str(TOPDOWN_COLUMNCUT_SCRIPT))
+        if not SAM3_IMAGE_SCRIPT.exists():
+            missing_scripts.append(str(SAM3_IMAGE_SCRIPT))
+        if missing_scripts:
+            lines = ["[POST-LITE]", "# 后处理精简版脚本缺失："]
+            for p in missing_scripts:
+                lines.append(f"# - {p}")
+            blocks.append("\n".join(lines))
+            return "\n\n".join(blocks)
+
+        lite_steps, lite_meta = build_postprocess_lite_commands(
+            python_exec=python_exec,
+            path_mode=path_mode,
+            source_path=source_path,
+            model_path=model_path,
+            post_iteration=int(post_iteration),
+            post_lite_input_ply=post_lite_input_ply,
+            post_lite_output_subdir=post_lite_output_subdir,
+            post_lite_num_views=int(post_lite_num_views),
+            post_lite_image_size=int(post_lite_image_size),
+            post_lite_fov_deg=float(post_lite_fov_deg),
+            post_lite_xoy_step_multiplier=float(post_lite_xoy_step_multiplier),
+            post_lite_semantic_prompts=post_lite_semantic_prompts,
+            post_lite_semantic_probe_views=int(post_lite_semantic_probe_views),
+            post_lite_sam_prompt=post_lite_sam_prompt,
+            post_lite_semantic_id=int(post_lite_semantic_id),
+            post_lite_min_instance_points=int(post_lite_min_instance_points),
+            post_lite_save_instance_parts=bool(post_lite_save_instance_parts),
+            sam3_checkpoint=sam3_checkpoint,
+            sam3_device=sam3_device,
+        )
+        cmd_lines = [
+            f"# input_ply={lite_meta['input_ply']}",
+            f"# pose_json={lite_meta['pose_json']}",
+            f"# instance_mask_dir={lite_meta['instance_mask_dir']}",
+        ]
+        for name, c in lite_steps:
+            cmd_lines.append(f"# {name}")
+            cmd_lines.append(shell_join(c))
+        blocks.append("[POST-LITE]\n" + "\n".join(cmd_lines))
+
     return "\n\n".join(blocks)
 
 
@@ -1207,6 +1632,19 @@ def start_training(
     post_instance_min_point_votes: int,
     post_min_instance_points: int,
     post_save_instance_parts: bool,
+    run_postprocess_lite: bool = False,
+    post_lite_input_ply: str = "",
+    post_lite_output_subdir: str = "topdown_instance_pipeline",
+    post_lite_num_views: int = 6,
+    post_lite_image_size: int = 1024,
+    post_lite_fov_deg: float = 58.0,
+    post_lite_xoy_step_multiplier: float = 1.0,
+    post_lite_semantic_prompts: str = "building,vehicle,person,bicycle,vegetation,road,traffic_facility,other",
+    post_lite_semantic_probe_views: int = 6,
+    post_lite_sam_prompt: str = "building",
+    post_lite_semantic_id: int = 3,
+    post_lite_min_instance_points: int = 3000,
+    post_lite_save_instance_parts: bool = True,
 ):
     if STATE.is_running():
         return (
@@ -1218,10 +1656,10 @@ def start_training(
             get_monitor_text(),
         )
 
-    if not run_sam3 and not run_training and not run_postprocess:
+    if not run_sam3 and not run_training and not run_postprocess and not run_postprocess_lite:
         return (
             "空闲（未选择流程）",
-            "请至少勾选一个流程：跑SAM3 / 跑训练 / 跑后处理",
+            "请至少勾选一个流程：跑SAM3 / 跑训练 / 跑后处理 / 跑后处理精简版",
             "",
             0.0,
             0,
@@ -1292,6 +1730,68 @@ def start_training(
                 STATE.append(f"[launcher]   - {p}")
             return (
                 "空闲（后处理脚本缺失）",
+                STATE.tail(),
+                shell_join(cmd) if run_training else "",
+                0.0,
+                0,
+                get_monitor_text(),
+            )
+
+    post_lite_steps: List[Tuple[str, List[str]]] = []
+    post_lite_meta: Dict[str, str] = {}
+    if run_postprocess_lite:
+        missing_scripts: List[str] = []
+        if not TOPDOWN_PIPELINE_SCRIPT.exists():
+            missing_scripts.append(str(TOPDOWN_PIPELINE_SCRIPT))
+        if not TOPDOWN_COLUMNCUT_SCRIPT.exists():
+            missing_scripts.append(str(TOPDOWN_COLUMNCUT_SCRIPT))
+        if not SAM3_PY.exists():
+            missing_scripts.append(str(SAM3_PY))
+        lite_ckpt_norm = (
+            normalize_path(sam3_checkpoint, mode=path_mode)
+            if (sam3_checkpoint or "").strip()
+            else str(SAM3_DEFAULT_CKPT)
+        )
+        if not Path(lite_ckpt_norm).exists():
+            missing_scripts.append(str(lite_ckpt_norm))
+        if missing_scripts:
+            STATE.append("[launcher] 后处理精简版依赖缺失:")
+            for p in missing_scripts:
+                STATE.append(f"[launcher]   - {p}")
+            return (
+                "空闲（后处理精简版脚本缺失）",
+                STATE.tail(),
+                shell_join(cmd) if run_training else "",
+                0.0,
+                0,
+                get_monitor_text(),
+            )
+
+        post_lite_steps, post_lite_meta = build_postprocess_lite_commands(
+            python_exec=python_exec,
+            path_mode=path_mode,
+            source_path=source_path,
+            model_path=model_path,
+            post_iteration=int(post_iteration),
+            post_lite_input_ply=post_lite_input_ply,
+            post_lite_output_subdir=post_lite_output_subdir,
+            post_lite_num_views=int(post_lite_num_views),
+            post_lite_image_size=int(post_lite_image_size),
+            post_lite_fov_deg=float(post_lite_fov_deg),
+            post_lite_xoy_step_multiplier=float(post_lite_xoy_step_multiplier),
+            post_lite_semantic_prompts=post_lite_semantic_prompts,
+            post_lite_semantic_probe_views=int(post_lite_semantic_probe_views),
+            post_lite_sam_prompt=post_lite_sam_prompt,
+            post_lite_semantic_id=int(post_lite_semantic_id),
+            post_lite_min_instance_points=int(post_lite_min_instance_points),
+            post_lite_save_instance_parts=bool(post_lite_save_instance_parts),
+            sam3_checkpoint=sam3_checkpoint,
+            sam3_device=sam3_device,
+        )
+        if not run_training and not Path(post_lite_meta["input_ply"]).exists():
+            STATE.append(f"[launcher] 精简版输入点云不存在: {post_lite_meta['input_ply']}")
+            return (
+                "空闲（后处理精简版输入缺失）",
                 STATE.tail(),
                 shell_join(cmd) if run_training else "",
                 0.0,
@@ -1467,10 +1967,16 @@ def start_training(
                 )
 
     if not run_training:
+        all_post_steps = []
         if run_postprocess:
+            all_post_steps.extend(post_steps)
+        if run_postprocess_lite:
+            all_post_steps.extend(post_lite_steps)
+
+        if all_post_steps:
             STATE.append("[launcher] 开始执行后处理流水线...")
-            ok = run_postprocess_steps(post_steps)
-            cmd_preview = "\n".join(shell_join(c) for _, c in post_steps)
+            ok = run_postprocess_steps(all_post_steps)
+            cmd_preview = "\n".join(shell_join(c) for _, c in all_post_steps)
             return (
                 "空闲（后处理完成）" if ok else "空闲（后处理失败）",
                 STATE.tail(),
@@ -1510,9 +2016,14 @@ def start_training(
     STATE.append("[launcher] training started")
     STATE.append(f"[launcher] cwd={ROOT_DIR}")
     STATE.append(f"[launcher] cmd={shell_join(cmd)}")
+    all_post_steps = []
     if run_postprocess and post_steps:
+        all_post_steps.extend(post_steps)
+    if run_postprocess_lite and post_lite_steps:
+        all_post_steps.extend(post_lite_steps)
+    if all_post_steps:
         STATE.append("[launcher] 已启用后处理：训练完成后自动执行聚合/实例步骤")
-    _spawn_reader(proc, post_steps=post_steps if run_postprocess else None)
+    _spawn_reader(proc, post_steps=all_post_steps if all_post_steps else None)
 
     # Prime CPU sampling baseline to avoid first read always 0.
     if PSUTIL_AVAILABLE:
