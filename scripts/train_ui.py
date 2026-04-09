@@ -7,6 +7,7 @@ and runs `train.py` as a subprocess.
 
 from __future__ import annotations
 
+import gc
 import os
 import re
 import shlex
@@ -85,7 +86,7 @@ SAM3_PY = Path("/mnt/d/sam3/.conda/envs/sam3/bin/python")
 SAM3_SCRIPT = Path("/mnt/d/sam3/sam3/scripts/batch_sam3_dji_masks.py")
 SAM3_IMAGE_SCRIPT = ROOT_DIR / "scripts" / "sam3_instance_from_images.py"
 STEP1_KMEANS_SEM_SCRIPT = ROOT_DIR / "scripts" / "step1_kmeans_semantic_rename.py"
-SAM3_DEFAULT_CKPT = Path("/mnt/c/Users/ysy/.cache/modelscope/hub/models/facebook/sam3/sam3.pt")
+SAM3_DEFAULT_CKPT = Path("/mnt/d/modelscope/hub/models/facebook/sam3/sam3.pt")
 DEFAULT_LITE_XY_JITTER_BASE = 0.22
 
 DEFAULT_ID2LABEL: Dict[int, str] = {
@@ -1151,6 +1152,36 @@ def run_postprocess_steps(post_steps: List[Tuple[str, List[str]]]) -> bool:
     return ok
 
 
+def cleanup_cuda_cache(reason: str = "") -> None:
+    """Best-effort CUDA cache cleanup in the launcher process."""
+    note = f" ({reason})" if reason else ""
+    try:
+        gc.collect()
+        if not torch.cuda.is_available():
+            STATE.append(f"[launcher] CUDA清理跳过{note}：未检测到CUDA设备")
+            return
+        if not torch.cuda.is_initialized():
+            STATE.append(f"[launcher] CUDA清理跳过{note}：launcher进程未初始化CUDA上下文")
+            return
+
+        before_alloc = torch.cuda.memory_allocated()
+        before_reserved = torch.cuda.memory_reserved()
+        torch.cuda.empty_cache()
+        if hasattr(torch.cuda, "ipc_collect"):
+            torch.cuda.ipc_collect()
+        after_alloc = torch.cuda.memory_allocated()
+        after_reserved = torch.cuda.memory_reserved()
+
+        mib = 1024 * 1024
+        STATE.append(
+            "[launcher] CUDA缓存清理"
+            f"{note}：alloc {before_alloc / mib:.1f}->{after_alloc / mib:.1f} MiB, "
+            f"reserved {before_reserved / mib:.1f}->{after_reserved / mib:.1f} MiB"
+        )
+    except Exception as exc:
+        STATE.append(f"[launcher] CUDA缓存清理失败{note}: {exc}")
+
+
 def run_postprocess_lite_split(
     python_exec: str,
     path_mode: str,
@@ -1331,6 +1362,7 @@ def _spawn_reader(proc: subprocess.Popen, post_steps: Optional[List[Tuple[str, L
         if code == 0:
             STATE.set_progress(progress=100.0)
         STATE.append(f"[train.py exited] code={code}")
+        cleanup_cuda_cache(reason="train.py exited")
         if code == 0 and post_steps:
             STATE.append("[launcher] 训练已完成，开始执行后处理流水线...")
             run_postprocess_steps(post_steps)
@@ -2002,6 +2034,7 @@ def start_training(
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    cleanup_cuda_cache(reason="before launch train.py")
 
     proc = subprocess.Popen(
         cmd,

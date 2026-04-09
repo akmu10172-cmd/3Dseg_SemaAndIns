@@ -1,19 +1,40 @@
-# OpenGaussian 语义 + 实例（4步流程）
+# OpenGaussian 语义 + 实例（训练 + 两种后处理）
 
-本项目是基于 OpenGaussian 的缝合流程，当前只使用 OpenGaussian 的 Stage1 特征，再做语义与实例分割。
+本项目基于 OpenGaussian，当前训练主线使用 Stage1 特征，再做语义/实例分割。
 
-## 1. 环境与路径约定
+## 1. 启动方式（推荐）
+
+当前主用方式是 **WSL 下启动 Qt 界面**：
+
+```bash
+cd /mnt/d/3Dseg_SemaAndIns
+bash scripts/run_train_qt.sh
+```
+
+如需指定环境里的 Python，可直接传路径：
+
+```bash
+bash scripts/run_train_qt.sh /home/ysy/miniconda3/envs/opengaussian/bin/python
+```
+
+Windows 一键入口（本质还是调用 WSL）：
+
+```bat
+scripts\run_train_qt_windows.cmd
+```
+
+Qt 内对应开关：
+- `跑后处理`：原始后处理（README 经典流程）
+- `跑后处理精简版`：抽视角重渲染图片 + SAM + 回投 3D
+
+## 2. 环境与路径约定
 
 - 项目目录：`/mnt/d/3Dseg_SemaAndIns`
 - 场景目录（示例）：`/mnt/d/Scene_huijin_0318_q4`
 - 2D 语义 mask：`/mnt/d/Scene_huijin_0318_q4/language_features`（`*_s.npy`）
 - 2D 实例 mask：`/mnt/d/Scene_huijin_0318_q4/language_features_instance`（`*_inst.npy`）
 
-```bash
-cd /mnt/d/3Dseg_SemaAndIns
-```
-
-## 2. 流程一：OpenGaussian Stage1 特征训练（到 40000）
+## 3. 训练：OpenGaussian Stage1（示例到 40000）
 
 ```bash
 python train.py \
@@ -35,7 +56,9 @@ python train.py \
 关键输出：
 - `/mnt/d/Scene_huijin_0318_q4/out_stage1/point_cloud/iteration_40000/point_cloud.ply`
 
-## 3. 流程二：聚类语义（KMeans 8 类）
+## 4. 后处理A：原始后处理（README经典流程）
+
+### 4.1 KMeans 聚类（8类）
 
 ```bash
 python scripts/cluster_semantic_kmeans.py \
@@ -46,10 +69,7 @@ python scripts/cluster_semantic_kmeans.py \
   --save_npz
 ```
 
-关键输出：
-- `/mnt/d/Scene_huijin_0318_q4/out_stage1/kmeans_8/class_0.ply ... class_7.ply`
-
-## 4. 流程三：确定语义标签并整合模型（只做语义，不做实例）
+### 4.2 语义投票与语义整合（只做语义）
 
 ```bash
 python scripts/semantic_instance_pipeline.py \
@@ -66,13 +86,9 @@ python scripts/semantic_instance_pipeline.py \
 ```
 
 说明：
-- 这里把 0~7 全部放进 `stuff_ids`，因此只进行语义投票与语义模型整合，不做实例切分。
+- 这里把 0~7 全部放入 `stuff_ids`，因此只做语义，不做实例。
 
-关键输出：
-- `/mnt/d/Scene_huijin_0318_q4/sem_stage/semantic_models/<id_label>/merged_semantic.ply`
-- `/mnt/d/Scene_huijin_0318_q4/sem_stage/semantic_instance_report.json`
-
-## 5. 流程四：2D 投影实例分割（proj2d）
+### 4.3 基于2D实例mask的投影实例分割（proj2d）
 
 ```bash
 python scripts/semantic_models_seg3d_instance.py \
@@ -102,8 +118,45 @@ python scripts/semantic_models_seg3d_instance.py \
 - `/mnt/d/Scene_huijin_0318_q4/sem_ins_proj2d/semantic_instance/001_vehicle_instances/instance_*.ply`
 - `/mnt/d/Scene_huijin_0318_q4/sem_ins_proj2d/semantic_models_seg3d_instance_report.json`
 
+## 5. 后处理B：简化版（抽视角重渲染 + SAM + 回投3D）
+
+简化版核心脚本：
+- `scripts/topdown_sam3_instance_pipeline.py`
+
+流程：
+1. 从输入点云抽取 topdown 视角并重渲染 `renders_topdown`
+2. 对渲染图跑 SAM3 实例分割
+3. 将 2D 实例结果投影回 3D，输出 `semantic_id + instance_id` 点云
+
+示例命令：
+
+```bash
+python scripts/topdown_sam3_instance_pipeline.py \
+  --scene_path /mnt/d/Scene_huijin_0318_q4 \
+  --input_ply /mnt/d/Scene_huijin_0318_q4/out_stage1/point_cloud/iteration_40000/point_cloud.ply \
+  --output_subdir topdown_instance_pipeline \
+  --num_views 8 \
+  --image_size 1024 \
+  --sam3_python /mnt/d/sam3/.conda/envs/sam3/bin/python \
+  --sam3_checkpoint /mnt/d/modelscope/hub/models/facebook/sam3/sam3.pt \
+  --sam3_device cuda \
+  --sam3_prompts "vehicle" \
+  --semantic_id 1 \
+  --min_instance_points 120
+```
+
+常见输出目录：
+- `<scene_path>/topdown_instance_pipeline/renders_topdown`
+- `<scene_path>/topdown_instance_pipeline/sam3_topdown`
+- `<scene_path>/topdown_instance_pipeline/instance_projected_sem_ins.ply`
+- `<scene_path>/topdown_instance_pipeline/report.json`
+
 ## 6. 快速验收
 
-重点看：
+原始后处理看：
 - `semantic_models_seg3d_instance_report.json` 里 vehicle 的 `num_instances`
-- `001_vehicle_sem_ins.ply` 是否语义/实例都合理
+- `001_vehicle_sem_ins.ply` 的语义/实例是否合理
+
+简化版看：
+- `report.json` 中 `instances_after`、`points_used` 等统计
+- `instance_projected_sem_ins.ply` 是否出现合理实例拆分

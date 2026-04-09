@@ -59,7 +59,7 @@ def main() -> None:
     p.add_argument("--output_dir", required=True)
     p.add_argument("--python_exec", default="python")
     p.add_argument("--sam3_python", default="/mnt/d/sam3/.conda/envs/sam3/bin/python")
-    p.add_argument("--sam3_checkpoint", default="/mnt/c/Users/ysy/.cache/modelscope/hub/models/facebook/sam3/sam3.pt")
+    p.add_argument("--sam3_checkpoint", default="/mnt/d/modelscope/hub/models/facebook/sam3/sam3.pt")
     p.add_argument("--sam3_device", default="cuda", choices=["cuda", "cpu"])
     p.add_argument("--semantic_prompts", default="building,vehicle,person,bicycle,vegetation,road,traffic_facility,other")
     p.add_argument("--semantic_probe_views", type=int, default=6)
@@ -177,4 +177,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

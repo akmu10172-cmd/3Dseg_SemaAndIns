@@ -108,6 +108,13 @@ class GaussianModel:
         denom,
         opt_dict, 
         self.spatial_lr_scale) = model_args
+        # Clamp SH degree to what checkpoint tensors actually contain.
+        # This keeps sh_degree=0 checkpoints (empty f_rest) from being
+        # accidentally promoted by defaults in launcher args.
+        total_sh_coeffs = int(self._features_dc.shape[1] + self._features_rest.shape[1])
+        inferred_max_sh = int(round(np.sqrt(max(total_sh_coeffs, 1)) - 1))
+        self.max_sh_degree = min(self.max_sh_degree, inferred_max_sh)
+        self.active_sh_degree = min(int(self.active_sh_degree), int(self.max_sh_degree))
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom

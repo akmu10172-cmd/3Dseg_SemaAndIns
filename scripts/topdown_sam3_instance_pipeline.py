@@ -53,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--xy_jitter_ratio", type=float, default=0.0, help="0 keeps exact center topdown")
 
     p.add_argument("--sam3_python", default="/mnt/d/sam3/.conda/envs/sam3/bin/python")
-    p.add_argument("--sam3_checkpoint", default="/mnt/c/Users/ysy/.cache/modelscope/hub/models/facebook/sam3/sam3.pt")
+    p.add_argument("--sam3_checkpoint", default="/mnt/d/modelscope/hub/models/facebook/sam3/sam3.pt")
     p.add_argument("--sam3_device", default="cuda", choices=["cuda", "cpu"])
     p.add_argument("--sam3_resolution", type=int, default=1008)
     p.add_argument("--sam3_conf", type=float, default=0.35)
