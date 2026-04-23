@@ -65,8 +65,12 @@ def main() -> None:
     p.add_argument("--semantic_probe_views", type=int, default=6)
     p.add_argument("--num_views", type=int, default=6)
     p.add_argument("--image_size", type=int, default=1024)
-    p.add_argument("--fov_deg", type=float, default=58.0)
+    p.add_argument("--fov_deg", type=float, default=58.0, help="Used only when projection_mode=perspective")
     p.add_argument("--xy_jitter_ratio", type=float, default=0.22)
+    p.add_argument("--projection_mode", default="orthographic", choices=["orthographic", "perspective"])
+    p.add_argument("--camera_grid_side", type=int, default=1)
+    p.add_argument("--camera_grid_step", type=float, default=0.0)
+    p.add_argument("--camera_height_offset", type=float, default=0.0)
     args = p.parse_args()
 
     scene_path = Path(args.scene_path)
@@ -95,33 +99,40 @@ def main() -> None:
         subdir = f"_step1_semprobe/{stem}"
         print(f"[{i}/{len(classes)}] probing {cls_ply.name}")
 
-        run_cmd(
-            [
-                str(args.python_exec),
-                str(topdown_script),
-                "--scene_path",
-                str(scene_path),
-                "--input_ply",
-                str(cls_ply),
-                "--output_subdir",
-                subdir,
-                "--num_views",
-                str(int(args.num_views)),
-                "--image_size",
-                str(int(args.image_size)),
-                "--fov_deg",
-                str(float(args.fov_deg)),
-                "--xy_jitter_ratio",
-                str(float(args.xy_jitter_ratio)),
-                "--sam3_python",
-                str(args.sam3_python),
-                "--sam3_checkpoint",
-                str(args.sam3_checkpoint),
-                "--sam3_device",
-                str(args.sam3_device),
-                "--render_only",
-            ]
-        )
+        topdown_cmd = [
+            str(args.python_exec),
+            str(topdown_script),
+            "--scene_path",
+            str(scene_path),
+            "--input_ply",
+            str(cls_ply),
+            "--output_subdir",
+            subdir,
+            "--num_views",
+            str(int(args.num_views)),
+            "--image_size",
+            str(int(args.image_size)),
+            "--xy_jitter_ratio",
+            str(float(args.xy_jitter_ratio)),
+            "--projection_mode",
+            str(args.projection_mode),
+            "--camera_grid_side",
+            str(int(args.camera_grid_side)),
+            "--camera_grid_step",
+            str(float(args.camera_grid_step)),
+            "--camera_height_offset",
+            str(float(args.camera_height_offset)),
+            "--sam3_python",
+            str(args.sam3_python),
+            "--sam3_checkpoint",
+            str(args.sam3_checkpoint),
+            "--sam3_device",
+            str(args.sam3_device),
+            "--render_only",
+        ]
+        if str(args.projection_mode).lower() == "perspective":
+            topdown_cmd.extend(["--fov_deg", str(float(args.fov_deg))])
+        run_cmd(topdown_cmd)
 
         render_dir = scene_path / subdir / "renders_topdown"
         probe_dir = scene_path / subdir / "semantic_probe"

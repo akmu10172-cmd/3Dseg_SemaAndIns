@@ -20,6 +20,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--semantic_id", type=int, default=3)
     p.add_argument("--mask_image", default="auto", help="e.g. top_001.png; auto picks mask with most instances")
     p.add_argument("--min_instance_points", type=int, default=3000)
+    p.add_argument(
+        "--seed_min_instance_points",
+        type=int,
+        default=1,
+        help="Minimum points for fused seeds before XOY column-cut expansion",
+    )
     p.add_argument("--mode", default="single_view", choices=["single_view", "all_views_fused"])
     p.add_argument("--fused_instance_npy", default="", help="point_instance_id.npy from multi-view fusion")
     p.add_argument("--xoy_stride_multiplier", type=float, default=1.0, help="XOY quantization stride multiplier")
@@ -75,12 +81,16 @@ def build_column_cut_from_fused(
     xyz: np.ndarray,
     fused_labels: np.ndarray,
     min_instance_points: int,
+    seed_min_instance_points: int,
     xoy_stride_multiplier: float,
 ):
     if fused_labels.shape[0] != xyz.shape[0]:
         raise ValueError(f"fused_labels size mismatch: labels={len(fused_labels)} points={len(xyz)}")
 
-    base_labels, _ = relabel_contiguous(fused_labels.astype(np.int32), min_points=max(1, int(min_instance_points)))
+    base_labels, _ = relabel_contiguous(
+        fused_labels.astype(np.int32),
+        min_points=max(1, int(seed_min_instance_points)),
+    )
     if int(np.sum(base_labels > 0)) == 0:
         return np.zeros((len(xyz),), dtype=np.int32), 0
 
@@ -140,6 +150,7 @@ def main() -> None:
             xyz=xyz,
             fused_labels=fused_labels,
             min_instance_points=int(args.min_instance_points),
+            seed_min_instance_points=int(args.seed_min_instance_points),
             xoy_stride_multiplier=float(args.xoy_stride_multiplier),
         )
         target_img = "all_views_fused"
@@ -209,6 +220,7 @@ def main() -> None:
         "params": {
             "semantic_id": int(args.semantic_id),
             "min_instance_points": int(args.min_instance_points),
+            "seed_min_instance_points": int(args.seed_min_instance_points),
             "mode": mode_used,
             "xoy_stride_multiplier": float(args.xoy_stride_multiplier),
         },

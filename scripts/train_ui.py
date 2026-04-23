@@ -935,11 +935,15 @@ def build_postprocess_lite_commands(
     post_lite_semantic_probe_views: int,
     post_lite_sam_prompt: str,
     post_lite_semantic_id: int,
+    post_lite_instance_min_point_votes: int,
+    post_lite_fused_min_instance_points: int,
     post_lite_min_instance_points: int,
     post_lite_save_instance_parts: bool,
     sam3_checkpoint: str,
     sam3_device: str,
     post_lite_mask_image: str = "auto",
+    run_post_lite_step1: bool = True,
+    run_post_lite_step2: bool = True,
 ) -> Tuple[List[Tuple[str, List[str]]], Dict[str, str]]:
     py = (python_exec or "").strip() or "python"
     scene_path = normalize_path(source_path, mode=path_mode)
@@ -965,6 +969,9 @@ def build_postprocess_lite_commands(
     column_out_dir = str(Path(pipe_root) / "instance_3d_columncut")
 
     xy_jitter_ratio = max(0.0, min(1.0, float(DEFAULT_LITE_XY_JITTER_BASE) * float(post_lite_xoy_step_multiplier)))
+    run_step1 = bool(run_post_lite_step1)
+    run_step2 = bool(run_post_lite_step2)
+    need_render = run_step1 or run_step2
 
     step1_cmd = [
         py,
@@ -1023,6 +1030,10 @@ def build_postprocess_lite_commands(
         (post_lite_sam_prompt or "building").strip(),
         "--semantic_id",
         str(int(post_lite_semantic_id)),
+        "--instance_min_point_votes",
+        str(int(post_lite_instance_min_point_votes)),
+        "--min_instance_points",
+        str(int(post_lite_fused_min_instance_points)),
         "--skip_render",
         "--semantic_probe_summary",
         semantic_probe_summary,
@@ -1032,36 +1043,38 @@ def build_postprocess_lite_commands(
     if post_lite_save_instance_parts:
         step2_cmd.append("--save_instance_parts")
 
-    semantic_prompts = (post_lite_semantic_prompts or "").strip()
-    if (not semantic_prompts) or semantic_prompts.lower() == "auto":
-        semantic_prompts = detect_semantic_prompts_for_lite(
-            path_mode=path_mode,
-            source_path=source_path,
-            fallback_prompt=(post_lite_sam_prompt or "building").strip(),
-        )
-    step_probe_cmd = [
-        str(SAM3_PY),
-        str(SAM3_IMAGE_SCRIPT),
-        "--input-dir",
-        render_dir,
-        "--output-dir",
-        semantic_probe_dir,
-        "--device",
-        sam3_device if sam3_device in {"cuda", "cpu"} else "cuda",
-        "--resolution",
-        "1008",
-        "--confidence-threshold",
-        "0.35",
-        "--prompts",
-        semantic_prompts,
-        "--min-mask-area",
-        "40",
-        "--checkpoint-path",
-        sam3_ckpt_norm,
-        "--no-hf-download",
-    ]
-    if int(post_lite_semantic_probe_views) > 0:
-        step_probe_cmd.extend(["--max-images", str(int(post_lite_semantic_probe_views))])
+    step_probe_cmd: Optional[List[str]] = None
+    if run_step1:
+        semantic_prompts = (post_lite_semantic_prompts or "").strip()
+        if (not semantic_prompts) or semantic_prompts.lower() == "auto":
+            semantic_prompts = detect_semantic_prompts_for_lite(
+                path_mode=path_mode,
+                source_path=source_path,
+                fallback_prompt=(post_lite_sam_prompt or "building").strip(),
+            )
+        step_probe_cmd = [
+            str(SAM3_PY),
+            str(SAM3_IMAGE_SCRIPT),
+            "--input-dir",
+            render_dir,
+            "--output-dir",
+            semantic_probe_dir,
+            "--device",
+            sam3_device if sam3_device in {"cuda", "cpu"} else "cuda",
+            "--resolution",
+            "1008",
+            "--confidence-threshold",
+            "0.35",
+            "--prompts",
+            semantic_prompts,
+            "--min-mask-area",
+            "40",
+            "--checkpoint-path",
+            sam3_ckpt_norm,
+            "--no-hf-download",
+        ]
+        if int(post_lite_semantic_probe_views) > 0:
+            step_probe_cmd.extend(["--max-images", str(int(post_lite_semantic_probe_views))])
 
     step3_cmd = [
         py,
@@ -1090,12 +1103,14 @@ def build_postprocess_lite_commands(
     if post_lite_save_instance_parts:
         step3_cmd.append("--save_instance_parts")
 
-    steps = [
-        ("post-lite-render-only", step1_cmd),
-        ("post-lite-semantic-probe", step_probe_cmd),
-        ("post-lite-instance-from-renders", step2_cmd),
-        ("post-lite-column-cut", step3_cmd),
-    ]
+    steps: List[Tuple[str, List[str]]] = []
+    if need_render:
+        steps.append(("post-lite-render-only", step1_cmd))
+    if run_step1 and step_probe_cmd is not None:
+        steps.append(("post-lite-semantic-probe", step_probe_cmd))
+    if run_step2:
+        steps.append(("post-lite-instance-from-renders", step2_cmd))
+        steps.append(("post-lite-column-cut", step3_cmd))
     meta = {
         "scene_path": scene_path,
         "model_path": model_path_norm,
@@ -1112,14 +1127,19 @@ def build_postprocess_lite_commands(
 
 
 def run_blocking_with_logs(cmd: List[str], prefix: str, track_side_process: bool = False) -> int:
+    env = os.environ.copy()
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("PYTHONUTF8", "1")
     proc = subprocess.Popen(
         cmd,
         cwd=str(ROOT_DIR),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
-        env=os.environ.copy(),
+        env=env,
     )
     if track_side_process:
         STATE.side_process = proc
@@ -1198,17 +1218,28 @@ def run_postprocess_lite_split(
     post_lite_semantic_probe_views: int,
     post_lite_sam_prompt: str,
     post_lite_semantic_id: int,
+    post_lite_instance_min_point_votes: int,
+    post_lite_fused_min_instance_points: int,
     post_lite_min_instance_points: int,
     post_lite_save_instance_parts: bool,
     sam3_checkpoint: str,
     sam3_device: str,
     mode: str,
     post_lite_mask_image: str = "auto",
+    run_post_lite_step1: bool = True,
+    run_post_lite_step2: bool = True,
 ) -> Tuple[str, str]:
     if STATE.is_running():
         return "训练或后处理正在运行", STATE.tail()
     if mode not in {"render_only", "instance_from_renders"}:
         return f"未知模式: {mode}", STATE.tail()
+
+    step1_enabled = bool(run_post_lite_step1)
+    step2_enabled = bool(run_post_lite_step2)
+    if mode == "render_only":
+        # “仅生成渲染图”始终只执行渲染
+        step1_enabled = True
+        step2_enabled = False
 
     lite_steps, _ = build_postprocess_lite_commands(
         python_exec=python_exec,
@@ -1226,18 +1257,25 @@ def run_postprocess_lite_split(
         post_lite_semantic_probe_views=int(post_lite_semantic_probe_views),
         post_lite_sam_prompt=post_lite_sam_prompt,
         post_lite_semantic_id=int(post_lite_semantic_id),
+        post_lite_instance_min_point_votes=int(post_lite_instance_min_point_votes),
+        post_lite_fused_min_instance_points=int(post_lite_fused_min_instance_points),
         post_lite_min_instance_points=int(post_lite_min_instance_points),
         post_lite_save_instance_parts=bool(post_lite_save_instance_parts),
         sam3_checkpoint=sam3_checkpoint,
         sam3_device=sam3_device,
         post_lite_mask_image=post_lite_mask_image,
+        run_post_lite_step1=step1_enabled,
+        run_post_lite_step2=step2_enabled,
     )
     if mode == "render_only":
-        steps = lite_steps[:1]
+        steps = [x for x in lite_steps if x[0] == "post-lite-render-only"]
         STATE.append("[launcher] 运行精简后处理: 仅生成渲染图")
     else:
-        steps = lite_steps[1:]
+        steps = [x for x in lite_steps if x[0] in {"post-lite-semantic-probe", "post-lite-instance-from-renders", "post-lite-column-cut"}]
         STATE.append("[launcher] 运行精简后处理: 基于当前渲染继续实例分割")
+        if not steps:
+            STATE.append("[launcher] 精简后处理: 未选择任何可执行步骤（Step1/Step2）")
+            return "失败", STATE.tail()
     ok = run_postprocess_steps(steps)
     return ("完成" if ok else "失败"), STATE.tail()
 
@@ -1439,8 +1477,12 @@ def preview_command(
     post_lite_semantic_probe_views: int = 6,
     post_lite_sam_prompt: str = "building",
     post_lite_semantic_id: int = 3,
+    post_lite_instance_min_point_votes: int = 2,
+    post_lite_fused_min_instance_points: int = 120,
     post_lite_min_instance_points: int = 3000,
     post_lite_save_instance_parts: bool = True,
+    run_post_lite_step1: bool = True,
+    run_post_lite_step2: bool = True,
 ):
     if not run_sam3 and not run_training and not run_postprocess and not run_postprocess_lite:
         return "请至少勾选一个流程：跑SAM3 / 跑训练 / 跑后处理 / 跑后处理精简版"
@@ -1559,12 +1601,14 @@ def preview_command(
             blocks.append("[POST]\n" + "\n".join(cmd_lines))
 
     if run_postprocess_lite:
+        lite_run_step1 = bool(run_post_lite_step1)
+        lite_run_step2 = bool(run_post_lite_step2)
         missing_scripts: List[str] = []
-        if not TOPDOWN_PIPELINE_SCRIPT.exists():
+        if (lite_run_step1 or lite_run_step2) and not TOPDOWN_PIPELINE_SCRIPT.exists():
             missing_scripts.append(str(TOPDOWN_PIPELINE_SCRIPT))
-        if not TOPDOWN_COLUMNCUT_SCRIPT.exists():
+        if lite_run_step2 and not TOPDOWN_COLUMNCUT_SCRIPT.exists():
             missing_scripts.append(str(TOPDOWN_COLUMNCUT_SCRIPT))
-        if not SAM3_IMAGE_SCRIPT.exists():
+        if lite_run_step1 and not SAM3_IMAGE_SCRIPT.exists():
             missing_scripts.append(str(SAM3_IMAGE_SCRIPT))
         if missing_scripts:
             lines = ["[POST-LITE]", "# 后处理精简版脚本缺失："]
@@ -1589,20 +1633,27 @@ def preview_command(
             post_lite_semantic_probe_views=int(post_lite_semantic_probe_views),
             post_lite_sam_prompt=post_lite_sam_prompt,
             post_lite_semantic_id=int(post_lite_semantic_id),
+            post_lite_instance_min_point_votes=int(post_lite_instance_min_point_votes),
+            post_lite_fused_min_instance_points=int(post_lite_fused_min_instance_points),
             post_lite_min_instance_points=int(post_lite_min_instance_points),
             post_lite_save_instance_parts=bool(post_lite_save_instance_parts),
             sam3_checkpoint=sam3_checkpoint,
             sam3_device=sam3_device,
+            run_post_lite_step1=lite_run_step1,
+            run_post_lite_step2=lite_run_step2,
         )
-        cmd_lines = [
-            f"# input_ply={lite_meta['input_ply']}",
-            f"# pose_json={lite_meta['pose_json']}",
-            f"# instance_mask_dir={lite_meta['instance_mask_dir']}",
-        ]
-        for name, c in lite_steps:
-            cmd_lines.append(f"# {name}")
-            cmd_lines.append(shell_join(c))
-        blocks.append("[POST-LITE]\n" + "\n".join(cmd_lines))
+        if not lite_steps:
+            blocks.append("[POST-LITE]\n# 未选择任何子步骤（Step1/Step2）")
+        else:
+            cmd_lines = [
+                f"# input_ply={lite_meta['input_ply']}",
+                f"# pose_json={lite_meta['pose_json']}",
+                f"# instance_mask_dir={lite_meta['instance_mask_dir']}",
+            ]
+            for name, c in lite_steps:
+                cmd_lines.append(f"# {name}")
+                cmd_lines.append(shell_join(c))
+            blocks.append("[POST-LITE]\n" + "\n".join(cmd_lines))
 
     return "\n\n".join(blocks)
 
@@ -1675,8 +1726,12 @@ def start_training(
     post_lite_semantic_probe_views: int = 6,
     post_lite_sam_prompt: str = "building",
     post_lite_semantic_id: int = 3,
+    post_lite_instance_min_point_votes: int = 2,
+    post_lite_fused_min_instance_points: int = 120,
     post_lite_min_instance_points: int = 3000,
     post_lite_save_instance_parts: bool = True,
+    run_post_lite_step1: bool = True,
+    run_post_lite_step2: bool = True,
 ):
     if STATE.is_running():
         return (
@@ -1769,67 +1824,7 @@ def start_training(
                 get_monitor_text(),
             )
 
-    post_lite_steps: List[Tuple[str, List[str]]] = []
-    post_lite_meta: Dict[str, str] = {}
-    if run_postprocess_lite:
-        missing_scripts: List[str] = []
-        if not TOPDOWN_PIPELINE_SCRIPT.exists():
-            missing_scripts.append(str(TOPDOWN_PIPELINE_SCRIPT))
-        if not TOPDOWN_COLUMNCUT_SCRIPT.exists():
-            missing_scripts.append(str(TOPDOWN_COLUMNCUT_SCRIPT))
-        if not SAM3_PY.exists():
-            missing_scripts.append(str(SAM3_PY))
-        lite_ckpt_norm = (
-            normalize_path(sam3_checkpoint, mode=path_mode)
-            if (sam3_checkpoint or "").strip()
-            else str(SAM3_DEFAULT_CKPT)
-        )
-        if not Path(lite_ckpt_norm).exists():
-            missing_scripts.append(str(lite_ckpt_norm))
-        if missing_scripts:
-            STATE.append("[launcher] 后处理精简版依赖缺失:")
-            for p in missing_scripts:
-                STATE.append(f"[launcher]   - {p}")
-            return (
-                "空闲（后处理精简版脚本缺失）",
-                STATE.tail(),
-                shell_join(cmd) if run_training else "",
-                0.0,
-                0,
-                get_monitor_text(),
-            )
-
-        post_lite_steps, post_lite_meta = build_postprocess_lite_commands(
-            python_exec=python_exec,
-            path_mode=path_mode,
-            source_path=source_path,
-            model_path=model_path,
-            post_iteration=int(post_iteration),
-            post_lite_input_ply=post_lite_input_ply,
-            post_lite_output_subdir=post_lite_output_subdir,
-            post_lite_num_views=int(post_lite_num_views),
-            post_lite_image_size=int(post_lite_image_size),
-            post_lite_fov_deg=float(post_lite_fov_deg),
-            post_lite_xoy_step_multiplier=float(post_lite_xoy_step_multiplier),
-            post_lite_semantic_prompts=post_lite_semantic_prompts,
-            post_lite_semantic_probe_views=int(post_lite_semantic_probe_views),
-            post_lite_sam_prompt=post_lite_sam_prompt,
-            post_lite_semantic_id=int(post_lite_semantic_id),
-            post_lite_min_instance_points=int(post_lite_min_instance_points),
-            post_lite_save_instance_parts=bool(post_lite_save_instance_parts),
-            sam3_checkpoint=sam3_checkpoint,
-            sam3_device=sam3_device,
-        )
-        if not run_training and not Path(post_lite_meta["input_ply"]).exists():
-            STATE.append(f"[launcher] 精简版输入点云不存在: {post_lite_meta['input_ply']}")
-            return (
-                "空闲（后处理精简版输入缺失）",
-                STATE.tail(),
-                shell_join(cmd) if run_training else "",
-                0.0,
-                0,
-                get_monitor_text(),
-            )
+    if run_postprocess:
         post_steps, post_meta = build_postprocess_commands(
             python_exec=python_exec,
             path_mode=path_mode,
@@ -1909,6 +1904,86 @@ def start_training(
                 get_monitor_text(),
             )
 
+
+    post_lite_steps: List[Tuple[str, List[str]]] = []
+    post_lite_meta: Dict[str, str] = {}
+    if run_postprocess_lite:
+        lite_run_step1 = bool(run_post_lite_step1)
+        lite_run_step2 = bool(run_post_lite_step2)
+        missing_scripts: List[str] = []
+        if (lite_run_step1 or lite_run_step2) and not TOPDOWN_PIPELINE_SCRIPT.exists():
+            missing_scripts.append(str(TOPDOWN_PIPELINE_SCRIPT))
+        if lite_run_step2 and not TOPDOWN_COLUMNCUT_SCRIPT.exists():
+            missing_scripts.append(str(TOPDOWN_COLUMNCUT_SCRIPT))
+        if lite_run_step1 and not SAM3_IMAGE_SCRIPT.exists():
+            missing_scripts.append(str(SAM3_IMAGE_SCRIPT))
+        if (lite_run_step1 or lite_run_step2) and not SAM3_PY.exists():
+            missing_scripts.append(str(SAM3_PY))
+        lite_ckpt_norm = (
+            normalize_path(sam3_checkpoint, mode=path_mode)
+            if (sam3_checkpoint or "").strip()
+            else str(SAM3_DEFAULT_CKPT)
+        )
+        if (lite_run_step1 or lite_run_step2) and not Path(lite_ckpt_norm).exists():
+            missing_scripts.append(str(lite_ckpt_norm))
+        if missing_scripts:
+            STATE.append("[launcher] 后处理精简版依赖缺失:")
+            for p in missing_scripts:
+                STATE.append(f"[launcher]   - {p}")
+            return (
+                "空闲（后处理精简版脚本缺失）",
+                STATE.tail(),
+                shell_join(cmd) if run_training else "",
+                0.0,
+                0,
+                get_monitor_text(),
+            )
+
+        post_lite_steps, post_lite_meta = build_postprocess_lite_commands(
+            python_exec=python_exec,
+            path_mode=path_mode,
+            source_path=source_path,
+            model_path=model_path,
+            post_iteration=int(post_iteration),
+            post_lite_input_ply=post_lite_input_ply,
+            post_lite_output_subdir=post_lite_output_subdir,
+            post_lite_num_views=int(post_lite_num_views),
+            post_lite_image_size=int(post_lite_image_size),
+            post_lite_fov_deg=float(post_lite_fov_deg),
+            post_lite_xoy_step_multiplier=float(post_lite_xoy_step_multiplier),
+            post_lite_semantic_prompts=post_lite_semantic_prompts,
+            post_lite_semantic_probe_views=int(post_lite_semantic_probe_views),
+            post_lite_sam_prompt=post_lite_sam_prompt,
+            post_lite_semantic_id=int(post_lite_semantic_id),
+            post_lite_instance_min_point_votes=int(post_lite_instance_min_point_votes),
+            post_lite_fused_min_instance_points=int(post_lite_fused_min_instance_points),
+            post_lite_min_instance_points=int(post_lite_min_instance_points),
+            post_lite_save_instance_parts=bool(post_lite_save_instance_parts),
+            sam3_checkpoint=sam3_checkpoint,
+            sam3_device=sam3_device,
+            run_post_lite_step1=lite_run_step1,
+            run_post_lite_step2=lite_run_step2,
+        )
+        if not post_lite_steps:
+            STATE.append("[launcher] 后处理精简版已启用，但未选择任何子步骤（Step1/Step2）")
+            return (
+                "空闲（后处理精简版配置无效）",
+                STATE.tail(),
+                shell_join(cmd) if run_training else "",
+                0.0,
+                0,
+                get_monitor_text(),
+            )
+        if not run_training and not Path(post_lite_meta["input_ply"]).exists():
+            STATE.append(f"[launcher] 精简版输入点云不存在: {post_lite_meta['input_ply']}")
+            return (
+                "空闲（后处理精简版输入缺失）",
+                STATE.tail(),
+                shell_join(cmd) if run_training else "",
+                0.0,
+                0,
+                get_monitor_text(),
+            )
     sam3_cmd: Optional[List[str]] = None
 
     if run_sam3:
@@ -2034,6 +2109,8 @@ def start_training(
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("PYTHONUTF8", "1")
     cleanup_cuda_cache(reason="before launch train.py")
 
     proc = subprocess.Popen(
@@ -2042,6 +2119,8 @@ def start_training(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
         env=env,
     )

@@ -301,15 +301,28 @@ class GaussianModel:
     def load_ply(self, path):
         plydata = PlyData.read(path)
 
+        prop_names = [p.name for p in plydata.elements[0].properties]
+        prop_set = set(prop_names)
+
         xyz = np.stack((np.asarray(plydata.elements[0]["x"]),
                         np.asarray(plydata.elements[0]["y"]),
                         np.asarray(plydata.elements[0]["z"])),  axis=1)
-        ins_feat = np.stack((np.asarray(plydata.elements[0]["ins_feat_r"]),
-                        np.asarray(plydata.elements[0]["ins_feat_g"]),
-                        np.asarray(plydata.elements[0]["ins_feat_b"]),
-                        np.asarray(plydata.elements[0]["ins_feat_r2"]),
-                        np.asarray(plydata.elements[0]["ins_feat_g2"]),
-                        np.asarray(plydata.elements[0]["ins_feat_b2"])),  axis=1)
+
+        # Support both legacy ins_feat names and indexed names.
+        legacy_ins = ["ins_feat_r", "ins_feat_g", "ins_feat_b", "ins_feat_r2", "ins_feat_g2", "ins_feat_b2"]
+        if set(legacy_ins).issubset(prop_set):
+            ins_cols = [np.asarray(plydata.elements[0][k]) for k in legacy_ins]
+            ins_feat = np.stack(ins_cols, axis=1)
+        else:
+            indexed_ins = [n for n in prop_names if n.startswith("ins_feat_") and n.split("_")[-1].isdigit()]
+            indexed_ins = sorted(indexed_ins, key=lambda x: int(x.split("_")[-1]))
+            if len(indexed_ins) == 0:
+                print("[load_ply] Warning: no ins_feat fields found, using zeros.")
+                ins_feat = np.zeros((xyz.shape[0], 6), dtype=np.float32)
+            else:
+                ins_cols = [np.asarray(plydata.elements[0][k]) for k in indexed_ins]
+                ins_feat = np.stack(ins_cols, axis=1)
+
         opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
         if not opacities.flags['C_CONTIGUOUS']:
             opacities = np.ascontiguousarray(opacities)
@@ -321,12 +334,22 @@ class GaussianModel:
 
         extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
         extra_f_names = sorted(extra_f_names, key = lambda x: int(x.split('_')[-1]))
-        assert len(extra_f_names)==3*(self.max_sh_degree + 1) ** 2 - 3
-        features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
-        for idx, attr_name in enumerate(extra_f_names):
-            features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
-        # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
-        features_extra = features_extra.reshape((features_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1))
+        if len(extra_f_names) == 0:
+            inferred_sh_degree = 0
+            features_extra = np.zeros((xyz.shape[0], 3, 0), dtype=np.float32)
+        else:
+            if len(extra_f_names) % 3 != 0:
+                raise ValueError(f"Invalid f_rest_* count: {len(extra_f_names)} (not divisible by 3)")
+            coeff_wo_dc = len(extra_f_names) // 3
+            total_coeff = coeff_wo_dc + 1
+            inferred_sh_degree = int(round(np.sqrt(total_coeff) - 1))
+            if (inferred_sh_degree + 1) ** 2 != total_coeff:
+                raise ValueError(f"Cannot infer SH degree from f_rest_* count={len(extra_f_names)}")
+            features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
+            for idx, attr_name in enumerate(extra_f_names):
+                features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
+            # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
+            features_extra = features_extra.reshape((features_extra.shape[0], 3, coeff_wo_dc))
 
         scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
         scale_names = sorted(scale_names, key = lambda x: int(x.split('_')[-1]))
@@ -348,6 +371,7 @@ class GaussianModel:
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
         self._ins_feat = nn.Parameter(torch.tensor(ins_feat, dtype=torch.float, device="cuda").requires_grad_(True))
 
+        self.max_sh_degree = int(inferred_sh_degree)
         self.active_sh_degree = self.max_sh_degree
 
     def replace_tensor_to_optimizer(self, tensor, name):

@@ -12,9 +12,12 @@ So behavior stays aligned with the existing Gradio launcher.
 
 from __future__ import annotations
 
+import os
 import queue
+import shutil
 import sys
 import threading
+import inspect
 from pathlib import Path
 from typing import Any, Tuple
 
@@ -56,6 +59,8 @@ try:
 except Exception as exc:
     raise SystemExit(f"Cannot import train_ui backend: {exc}")
 
+LAUNCHER_PYTHON_ENV = "TRAIN_QT_PYTHON"
+
 class TrainQtWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -68,6 +73,7 @@ class TrainQtWindow(QMainWindow):
 
         self._build_ui()
         self._load_ui_settings()
+        self._apply_python_exec_from_launcher()
         if not self.post_lite_input_ply.text().strip():
             self.on_fill_post_lite_defaults()
 
@@ -202,19 +208,20 @@ class TrainQtWindow(QMainWindow):
         sam_grid.addWidget(self.sam3_device, row, 3)
         body_layout.addWidget(sam_group)
 
-        post_group = QGroupBox("后处理（可选）")
+        post_group = QGroupBox("后处理（基础，仅聚类）")
         post_grid = QGridLayout(post_group)
-        self.run_postprocess = QCheckBox("跑后处理")
+        self.run_postprocess = QCheckBox("跑后处理（基础）")
         self.post_auto_sync_id2label = QCheckBox("自动同步 id2label")
-        self.post_auto_sync_id2label.setChecked(True)
+        self.post_auto_sync_id2label.setChecked(False)
         self.run_post_mask2inst = QCheckBox("语义mask转实例mask")
-        self.run_post_mask2inst.setChecked(True)
-        self.run_post_cluster = QCheckBox("聚类")
+        self.run_post_mask2inst.setChecked(False)
+        self.run_post_cluster = QCheckBox("仅聚类（固定）")
         self.run_post_cluster.setChecked(True)
+        self.run_post_cluster.setEnabled(False)
         self.run_post_semantic = QCheckBox("语义聚合")
-        self.run_post_semantic.setChecked(True)
+        self.run_post_semantic.setChecked(False)
         self.run_post_instance = QCheckBox("实例分割")
-        self.run_post_instance.setChecked(True)
+        self.run_post_instance.setChecked(False)
         self.post_iteration = QSpinBox()
         self.post_iteration.setRange(1, 10_000_000)
         self.post_iteration.setValue(40000)
@@ -294,12 +301,8 @@ class TrainQtWindow(QMainWindow):
         self._set_small_path_button(self.btn_pick_instance_mask_dir)
 
         row = 0
-        post_grid.addWidget(self.run_postprocess, row, 0)
-        post_grid.addWidget(self.run_post_mask2inst, row, 1)
-        post_grid.addWidget(self.run_post_cluster, row, 2)
-        post_grid.addWidget(self.run_post_semantic, row, 3)
-        row += 1
-        post_grid.addWidget(self.run_post_instance, row, 1)
+        post_grid.addWidget(self.run_postprocess, row, 0, 1, 2)
+        post_grid.addWidget(self.run_post_cluster, row, 2, 1, 2)
         row += 1
         post_grid.addWidget(QLabel("后处理迭代步"), row, 0)
         post_grid.addWidget(self.post_iteration, row, 1)
@@ -314,82 +317,16 @@ class TrainQtWindow(QMainWindow):
         post_grid.addWidget(self.post_cluster_output_dir, row, 1, 1, 2)
         post_grid.addWidget(self.btn_pick_cluster_output_dir, row, 3)
         row += 1
-        post_grid.addWidget(QLabel("语义输出目录"), row, 0)
-        post_grid.addWidget(self.post_sem_output_dir, row, 1, 1, 2)
-        post_grid.addWidget(self.btn_pick_sem_output_dir, row, 3)
-        row += 1
-        post_grid.addWidget(QLabel("实例输出目录"), row, 0)
-        post_grid.addWidget(self.post_instance_output_dir, row, 1, 1, 2)
-        post_grid.addWidget(self.btn_pick_instance_output_dir, row, 3)
-        row += 1
-        post_grid.addWidget(QLabel("语义投票忽略ID"), row, 0)
-        post_grid.addWidget(self.post_vote_ignore_ids, row, 1)
-        post_grid.addWidget(QLabel("语义最小票数"), row, 2)
-        post_grid.addWidget(self.post_min_votes, row, 3)
-        row += 1
-        post_grid.addWidget(QLabel("语义Top1阈值"), row, 0)
-        post_grid.addWidget(self.post_min_top1_ratio, row, 1)
-        post_grid.addWidget(self.post_auto_sync_id2label, row, 2, 1, 2)
-        row += 1
-        post_grid.addWidget(QLabel("mask2inst输出目录"), row, 0)
-        post_grid.addWidget(self.post_mask2inst_output_dir, row, 1, 1, 2)
-        post_grid.addWidget(self.btn_pick_mask2inst_out_dir, row, 3)
-        row += 1
-        post_grid.addWidget(QLabel("mask2inst忽略ID"), row, 0)
-        post_grid.addWidget(self.post_mask2inst_ignore_ids, row, 1)
-        post_grid.addWidget(QLabel("mask2inst最小面积"), row, 2)
-        post_grid.addWidget(self.post_mask2inst_min_area, row, 3)
-        row += 1
-        post_grid.addWidget(QLabel("id2label"), row, 0)
-        post_grid.addWidget(self.post_id2label, row, 1, 1, 2)
-        post_grid.addWidget(self.btn_load_id2label, row, 3)
-        row += 1
-        post_grid.addWidget(QLabel("读取状态"), row, 0)
-        post_grid.addWidget(self.post_id2label_status, row, 1, 1, 3)
-        row += 1
-        post_grid.addWidget(QLabel("语义stuff_ids"), row, 0)
-        post_grid.addWidget(self.post_sem_stuff_ids, row, 1, 1, 3)
-        row += 1
-        post_grid.addWidget(QLabel("实例仅处理语义ID"), row, 0)
-        post_grid.addWidget(self.post_semantic_only_ids, row, 1)
-        post_grid.addWidget(QLabel("实例阶段stuff_ids"), row, 2)
-        post_grid.addWidget(self.post_instance_stuff_ids, row, 3)
-        row += 1
-        post_grid.addWidget(QLabel("实例单标签"), row, 0)
-        post_grid.addWidget(self.post_instance_single_label, row, 1, 1, 3)
-        row += 1
-        post_grid.addWidget(QLabel("实例mask目录"), row, 0)
-        post_grid.addWidget(self.post_instance_mask_dir, row, 1, 1, 2)
-        post_grid.addWidget(self.btn_pick_instance_mask_dir, row, 3)
-        row += 1
-        post_grid.addWidget(QLabel("实例mask模式"), row, 0)
-        post_grid.addWidget(self.post_instance_mask_mode, row, 1)
-        post_grid.addWidget(QLabel("实例mask后缀"), row, 2)
-        post_grid.addWidget(self.post_instance_mask_suffix, row, 3)
-        row += 1
-        post_grid.addWidget(QLabel("实例mask层级"), row, 0)
-        post_grid.addWidget(self.post_instance_mask_level, row, 1)
-        post_grid.addWidget(QLabel("实例mask忽略ID"), row, 2)
-        post_grid.addWidget(self.post_instance_mask_ignore_ids, row, 3)
-        row += 1
-        post_grid.addWidget(QLabel("实例投票步长"), row, 0)
-        post_grid.addWidget(self.post_instance_vote_stride, row, 1)
-        post_grid.addWidget(QLabel("实例最小mask点数"), row, 2)
-        post_grid.addWidget(self.post_instance_min_mask_points, row, 3)
-        row += 1
-        post_grid.addWidget(QLabel("实例匹配IoU"), row, 0)
-        post_grid.addWidget(self.post_instance_match_iou, row, 1)
-        post_grid.addWidget(QLabel("实例最小点票数"), row, 2)
-        post_grid.addWidget(self.post_instance_min_point_votes, row, 3)
-        row += 1
-        post_grid.addWidget(QLabel("实例最小点数"), row, 0)
-        post_grid.addWidget(self.post_min_instance_points, row, 1)
-        post_grid.addWidget(self.post_save_instance_parts, row, 2, 1, 2)
+        post_grid.addWidget(QLabel("说明：语义/实例后处理统一使用下方后处理精简版。"), row, 0, 1, 4)
         body_layout.addWidget(post_group)
 
         post_lite_group = QGroupBox("后处理精简版（Step1语义命名 + Step2实例分割）")
         post_lite_layout = QVBoxLayout(post_lite_group)
         self.run_postprocess_lite = QCheckBox("跑后处理精简版")
+        self.run_post_lite_step1 = QCheckBox("执行 Step1 语义探测")
+        self.run_post_lite_step1.setChecked(True)
+        self.run_post_lite_step2 = QCheckBox("执行 Step2 实例分割")
+        self.run_post_lite_step2.setChecked(True)
         self.post_lite_input_ply = QLineEdit("")
         self.btn_pick_post_lite_input_ply = QPushButton("选择文件...")
         self.post_lite_kmeans_dir = QLineEdit("")
@@ -398,20 +335,25 @@ class TrainQtWindow(QMainWindow):
         self.btn_pick_post_lite_kmeans_sem_output_dir = QPushButton("浏览...")
         self.post_lite_output_subdir = QLineEdit("topdown_instance_pipeline")
         self.post_lite_num_views = QSpinBox()
-        self.post_lite_num_views.setRange(1, 128)
+        self.post_lite_num_views.setRange(1, 64)
         self.post_lite_num_views.setValue(6)
+        self.post_lite_num_views.setToolTip("网格边长 N（正射模式下渲染 N×N 张）")
         self.post_lite_image_size = QSpinBox()
         self.post_lite_image_size.setRange(256, 4096)
         self.post_lite_image_size.setSingleStep(128)
         self.post_lite_image_size.setValue(1024)
+        self.post_lite_projection_hint_step1 = QLabel("Orthographic DOM (固定)")
+        self.post_lite_projection_hint_step2 = QLabel("Orthographic DOM (固定)")
         self.post_lite_fov_deg = QDoubleSpinBox()
-        self.post_lite_fov_deg.setRange(10.0, 170.0)
+        self.post_lite_fov_deg.setRange(-5000.0, 5000.0)
         self.post_lite_fov_deg.setSingleStep(1.0)
-        self.post_lite_fov_deg.setValue(58.0)
+        self.post_lite_fov_deg.setValue(0.0)
+        self.post_lite_fov_deg.setToolTip("自动高度基础上的额外偏移（可负值）")
         self.post_lite_xoy_step_multiplier = QDoubleSpinBox()
-        self.post_lite_xoy_step_multiplier.setRange(0.2, 5.0)
-        self.post_lite_xoy_step_multiplier.setSingleStep(0.1)
-        self.post_lite_xoy_step_multiplier.setValue(1.0)
+        self.post_lite_xoy_step_multiplier.setRange(0.0, 5000.0)
+        self.post_lite_xoy_step_multiplier.setSingleStep(1.0)
+        self.post_lite_xoy_step_multiplier.setValue(0.0)
+        self.post_lite_xoy_step_multiplier.setToolTip("XOY网格步长（世界坐标单位，设为0时自动计算）")
         self.post_lite_semantic_prompts = QLineEdit(
             "building,vehicle,person,bicycle,vegetation,road,traffic_facility,other"
         )
@@ -424,6 +366,14 @@ class TrainQtWindow(QMainWindow):
         self.post_lite_semantic_id = QSpinBox()
         self.post_lite_semantic_id.setRange(0, 255)
         self.post_lite_semantic_id.setValue(3)
+        self.post_lite_instance_min_point_votes = QSpinBox()
+        self.post_lite_instance_min_point_votes.setRange(1, 1000)
+        self.post_lite_instance_min_point_votes.setValue(2)
+        self.post_lite_fused_min_instance_points = QSpinBox()
+        self.post_lite_fused_min_instance_points.setRange(1, 10_000_000)
+        self.post_lite_fused_min_instance_points.setValue(120)
+        self.post_lite_sam3_checkpoint = QLineEdit(str(backend.SAM3_DEFAULT_CKPT))
+        self.btn_pick_post_lite_sam3_checkpoint = QPushButton("选择文件...")
         self.post_lite_min_instance_points = QSpinBox()
         self.post_lite_min_instance_points.setRange(1, 10_000_000)
         self.post_lite_min_instance_points.setValue(3000)
@@ -439,8 +389,14 @@ class TrainQtWindow(QMainWindow):
         self._set_small_path_button(self.btn_pick_post_lite_input_ply)
         self._set_small_path_button(self.btn_pick_post_lite_kmeans_dir)
         self._set_small_path_button(self.btn_pick_post_lite_kmeans_sem_output_dir)
+        self._set_small_path_button(self.btn_pick_post_lite_sam3_checkpoint)
 
         post_lite_layout.addWidget(self.run_postprocess_lite)
+        post_lite_switch_row = QHBoxLayout()
+        post_lite_switch_row.addWidget(self.run_post_lite_step1)
+        post_lite_switch_row.addWidget(self.run_post_lite_step2)
+        post_lite_switch_row.addStretch(1)
+        post_lite_layout.addLayout(post_lite_switch_row)
         post_lite_layout.addWidget(self.post_lite_hint)
 
         step1_group = QGroupBox("STEP1：kmeans语义重命名")
@@ -460,17 +416,20 @@ class TrainQtWindow(QMainWindow):
         row += 1
         step1_grid.addWidget(QLabel("语义探测视角数"), row, 0)
         step1_grid.addWidget(self.post_lite_semantic_probe_views, row, 1)
-        step1_grid.addWidget(QLabel("俯视视角数"), row, 2)
+        step1_grid.addWidget(QLabel("网格边长N"), row, 2)
         step1_grid.addWidget(self.post_lite_num_views, row, 3)
         row += 1
         step1_grid.addWidget(QLabel("渲染分辨率"), row, 0)
         step1_grid.addWidget(self.post_lite_image_size, row, 1)
-        step1_grid.addWidget(QLabel("FOV(度)"), row, 2)
+        step1_grid.addWidget(QLabel("投影模式"), row, 2)
+        step1_grid.addWidget(self.post_lite_projection_hint_step1, row, 3)
+        row += 1
+        step1_grid.addWidget(QLabel("XOY网格步长"), row, 0)
+        step1_grid.addWidget(self.post_lite_xoy_step_multiplier, row, 1)
+        step1_grid.addWidget(QLabel("高度偏移"), row, 2)
         step1_grid.addWidget(self.post_lite_fov_deg, row, 3)
         row += 1
-        step1_grid.addWidget(QLabel("XOY步长倍率"), row, 0)
-        step1_grid.addWidget(self.post_lite_xoy_step_multiplier, row, 1)
-        step1_grid.addWidget(self.btn_post_lite_step1_kmeans_semantic, row, 2, 1, 2)
+        step1_grid.addWidget(self.btn_post_lite_step1_kmeans_semantic, row, 0, 1, 4)
         post_lite_layout.addWidget(step1_group)
 
         step2_group = QGroupBox("STEP2：俯视渲染 -> SAM3实例 -> 纵向切割")
@@ -482,23 +441,36 @@ class TrainQtWindow(QMainWindow):
         row += 1
         step2_grid.addWidget(QLabel("输出子目录"), row, 0)
         step2_grid.addWidget(self.post_lite_output_subdir, row, 1)
-        step2_grid.addWidget(QLabel("俯视视角数"), row, 2)
+        step2_grid.addWidget(QLabel("网格边长N"), row, 2)
         step2_grid.addWidget(self.post_lite_num_views, row, 3)
+        row += 1
+        step2_grid.addWidget(QLabel("SAM3权重(后处理)"), row, 0)
+        step2_grid.addWidget(self.post_lite_sam3_checkpoint, row, 1, 1, 2)
+        step2_grid.addWidget(self.btn_pick_post_lite_sam3_checkpoint, row, 3)
         row += 1
         step2_grid.addWidget(QLabel("渲染分辨率"), row, 0)
         step2_grid.addWidget(self.post_lite_image_size, row, 1)
-        step2_grid.addWidget(QLabel("FOV(度)"), row, 2)
-        step2_grid.addWidget(self.post_lite_fov_deg, row, 3)
+        step2_grid.addWidget(QLabel("投影模式"), row, 2)
+        step2_grid.addWidget(self.post_lite_projection_hint_step2, row, 3)
         row += 1
-        step2_grid.addWidget(QLabel("XOY步长倍率"), row, 0)
+        step2_grid.addWidget(QLabel("XOY网格步长"), row, 0)
         step2_grid.addWidget(self.post_lite_xoy_step_multiplier, row, 1)
         step2_grid.addWidget(QLabel("SAM提示词"), row, 2)
         step2_grid.addWidget(self.post_lite_sam_prompt, row, 3)
         row += 1
+        step2_grid.addWidget(QLabel("高度偏移"), row, 0)
+        step2_grid.addWidget(self.post_lite_fov_deg, row, 1)
+        row += 1
         step2_grid.addWidget(QLabel("语义ID"), row, 0)
         step2_grid.addWidget(self.post_lite_semantic_id, row, 1)
-        step2_grid.addWidget(QLabel("纵向切割最小点数"), row, 2)
-        step2_grid.addWidget(self.post_lite_min_instance_points, row, 3)
+        step2_grid.addWidget(QLabel("最小票数"), row, 2)
+        step2_grid.addWidget(self.post_lite_instance_min_point_votes, row, 3)
+        row += 1
+        step2_grid.addWidget(QLabel("融合最小点数"), row, 0)
+        step2_grid.addWidget(self.post_lite_fused_min_instance_points, row, 1)
+        row += 1
+        step2_grid.addWidget(QLabel("纵向切割最小点数"), row, 0)
+        step2_grid.addWidget(self.post_lite_min_instance_points, row, 1)
         row += 1
         step2_grid.addWidget(self.post_lite_save_instance_parts, row, 0, 1, 2)
         step2_grid.addWidget(self.btn_fill_post_lite_defaults, row, 2, 1, 2)
@@ -650,6 +622,9 @@ class TrainQtWindow(QMainWindow):
         self.btn_pick_post_lite_kmeans_sem_output_dir.clicked.connect(
             lambda: self._pick_directory(self.post_lite_kmeans_sem_output_dir, "选择Step1输出语义目录")
         )
+        self.btn_pick_post_lite_sam3_checkpoint.clicked.connect(
+            lambda: self._pick_file(self.post_lite_sam3_checkpoint, "选择后处理 SAM3 权重", "Checkpoint (*.pt *.pth);;All Files (*)")
+        )
         self.btn_fill_post_lite_defaults.clicked.connect(self.on_fill_post_lite_defaults)
         self.btn_load_post_lite_semantic_prompts.clicked.connect(self.on_load_post_lite_semantic_prompts)
         self.btn_post_lite_render_only.clicked.connect(self.on_post_lite_render_only)
@@ -728,11 +703,47 @@ class TrainQtWindow(QMainWindow):
             "post_lite_kmeans_dir": self.post_lite_kmeans_dir,
             "post_lite_kmeans_sem_output_dir": self.post_lite_kmeans_sem_output_dir,
             "post_lite_output_subdir": self.post_lite_output_subdir,
+            "post_lite_sam3_checkpoint": self.post_lite_sam3_checkpoint,
         }
         for key, widget in keys.items():
             val = self._settings.value(f"ui/{key}", "", str)
             if val:
                 widget.setText(val)
+
+        bool_keys = {
+            "run_post_lite_step1": self.run_post_lite_step1,
+            "run_post_lite_step2": self.run_post_lite_step2,
+        }
+        for key, widget in bool_keys.items():
+            raw = self._settings.value(f"ui/{key}", None)
+            if raw is None:
+                continue
+            if isinstance(raw, str):
+                widget.setChecked(raw.strip().lower() in {"1", "true", "yes", "on"})
+            else:
+                widget.setChecked(bool(raw))
+
+        default_ckpt = str(backend.SAM3_DEFAULT_CKPT)
+        legacy_ckpt = str(getattr(backend, "SAM3_LEGACY_DEFAULT_CKPT", ""))
+        for w in (self.sam3_checkpoint, self.post_lite_sam3_checkpoint):
+            curr = w.text().strip()
+            norm = backend.normalize_path(curr, mode="auto") if curr else ""
+            if (not curr) or (legacy_ckpt and norm == legacy_ckpt):
+                w.setText(default_ckpt)
+
+    def _apply_python_exec_from_launcher(self) -> None:
+        launcher_python = os.environ.get(LAUNCHER_PYTHON_ENV, "").strip()
+        if launcher_python:
+            self.python_exec.setText(launcher_python)
+            return
+
+        current = self.python_exec.text().strip()
+        if current:
+            if current in {"python", "python3"} and shutil.which(current) is None:
+                self.python_exec.setText(sys.executable)
+            return
+
+        self.python_exec.setText(sys.executable)
 
     def _save_ui_settings(self) -> None:
         keys = {
@@ -753,13 +764,25 @@ class TrainQtWindow(QMainWindow):
             "post_lite_kmeans_dir": self.post_lite_kmeans_dir,
             "post_lite_kmeans_sem_output_dir": self.post_lite_kmeans_sem_output_dir,
             "post_lite_output_subdir": self.post_lite_output_subdir,
+            "post_lite_sam3_checkpoint": self.post_lite_sam3_checkpoint,
         }
         for key, widget in keys.items():
             self._settings.setValue(f"ui/{key}", widget.text().strip())
+        bool_keys = {
+            "run_post_lite_step1": self.run_post_lite_step1,
+            "run_post_lite_step2": self.run_post_lite_step2,
+        }
+        for key, widget in bool_keys.items():
+            self._settings.setValue(f"ui/{key}", bool(widget.isChecked()))
         self._settings.sync()
 
     def _collect_args(self) -> Tuple[Any, ...]:
         run_post = bool(self.run_postprocess.isChecked())
+        run_post_lite = bool(self.run_postprocess_lite.isChecked())
+        sam3_ckpt = self.sam3_checkpoint.text().strip()
+        lite_ckpt = self.post_lite_sam3_checkpoint.text().strip()
+        if run_post_lite and lite_ckpt:
+            sam3_ckpt = lite_ckpt
         return (
             self.python_exec.text().strip(),
             self._current_path_mode(),
@@ -780,18 +803,18 @@ class TrainQtWindow(QMainWindow):
             bool(self.run_training.isChecked()),
             self.sam3_input_dir.text().strip(),
             self.sam3_output_dir.text().strip(),
-            self.sam3_checkpoint.text().strip(),
+            sam3_ckpt,
             self.sam3_device.currentText().strip(),
             bool(self.sam3_export.isChecked()),
-            bool(self.post_auto_sync_id2label.isChecked()),
+            False,
             run_post,  # run_postprocess
-            bool(self.run_post_mask2inst.isChecked()),
+            False,
             self.post_mask2inst_output_dir.text().strip(),
             int(self.post_mask2inst_min_area.value()),
             self.post_mask2inst_ignore_ids.text().strip(),
-            bool(self.run_post_cluster.isChecked()),
-            bool(self.run_post_semantic.isChecked()),
-            bool(self.run_post_instance.isChecked()),
+            run_post,
+            False,
+            False,
             int(self.post_iteration.value()),
             self.post_input_ply.text().strip(),
             int(self.post_n_clusters.value()),
@@ -817,7 +840,7 @@ class TrainQtWindow(QMainWindow):
             int(self.post_instance_min_point_votes.value()),
             int(self.post_min_instance_points.value()),
             bool(self.post_save_instance_parts.isChecked()),
-            bool(self.run_postprocess_lite.isChecked()),
+            run_post_lite,
             self.post_lite_input_ply.text().strip(),
             self.post_lite_output_subdir.text().strip(),
             int(self.post_lite_num_views.value()),
@@ -828,9 +851,29 @@ class TrainQtWindow(QMainWindow):
             int(self.post_lite_semantic_probe_views.value()),
             self.post_lite_sam_prompt.text().strip(),
             int(self.post_lite_semantic_id.value()),
+            int(self.post_lite_instance_min_point_votes.value()),
+            int(self.post_lite_fused_min_instance_points.value()),
             int(self.post_lite_min_instance_points.value()),
             bool(self.post_lite_save_instance_parts.isChecked()),
+            bool(self.run_post_lite_step1.isChecked()),
+            bool(self.run_post_lite_step2.isChecked()),
         )
+
+    def _call_backend_compat(self, func, args: Tuple[Any, ...]) -> Any:
+        """Call backend with positional args while tolerating tail-parameter drift."""
+        try:
+            sig = inspect.signature(func)
+            positional_params = [
+                p
+                for p in sig.parameters.values()
+                if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            ]
+            max_pos = len(positional_params)
+            if len(args) > max_pos:
+                args = args[:max_pos]
+        except Exception:
+            pass
+        return func(*args)
 
     def _show_loading(self, text: str) -> None:
         return
@@ -910,7 +953,7 @@ class TrainQtWindow(QMainWindow):
         self._run_async_with_loading(
             "preview",
             "正在生成命令预览...",
-            lambda: backend.preview_command(*args),
+            lambda: self._call_backend_compat(backend.preview_command, args),
         )
 
     def on_start(self) -> None:
@@ -921,7 +964,8 @@ class TrainQtWindow(QMainWindow):
 
         def _worker() -> None:
             try:
-                ret = backend.start_training(*self._collect_args())
+                args = self._collect_args()
+                ret = self._call_backend_compat(backend.start_training, args)
                 self._queue.put(("start_ok", ret))
             except Exception as exc:
                 self._queue.put(("start_err", exc))
@@ -969,19 +1013,25 @@ class TrainQtWindow(QMainWindow):
         self.post_lite_kmeans_dir.setText("D:\\Scene_0325\\test0402\\point_cloud\\iteration_31000\\kmeans_5")
         self.post_lite_kmeans_sem_output_dir.setText("D:\\Scene_0325\\test0402\\point_cloud\\iteration_31000\\kmeans_5\\semantic_named")
         self.post_lite_output_subdir.setText("topdown_instance_pipeline")
-        self.post_lite_num_views.setValue(6)
+        self.post_lite_num_views.setValue(3)
         self.post_lite_image_size.setValue(1024)
-        self.post_lite_fov_deg.setValue(58.0)
-        self.post_lite_xoy_step_multiplier.setValue(1.0)
+        self.post_lite_fov_deg.setValue(0.0)
+        self.post_lite_xoy_step_multiplier.setValue(20.0)
         self.post_lite_semantic_prompts.setText("auto")
         self.post_lite_semantic_probe_views.setValue(6)
         self.post_lite_sam_prompt.setText("building")
         self.post_lite_semantic_id.setValue(3)
+        self.post_lite_instance_min_point_votes.setValue(2)
+        self.post_lite_fused_min_instance_points.setValue(120)
         self.post_lite_min_instance_points.setValue(3000)
         self.post_lite_save_instance_parts.setChecked(True)
+        self.run_post_lite_step1.setChecked(True)
+        self.run_post_lite_step2.setChecked(True)
         self.sam3_device.setCurrentText("cuda")
         if not self.sam3_checkpoint.text().strip():
             self.sam3_checkpoint.setText(str(backend.SAM3_DEFAULT_CKPT))
+        if not self.post_lite_sam3_checkpoint.text().strip():
+            self.post_lite_sam3_checkpoint.setText(str(backend.SAM3_DEFAULT_CKPT))
 
     def _topdown_render_dir(self) -> Path:
         scene_path = backend.normalize_path(self.source_path.text().strip(), mode=self._current_path_mode())
@@ -1043,9 +1093,11 @@ class TrainQtWindow(QMainWindow):
             int(self.post_lite_semantic_probe_views.value()),
             self.post_lite_sam_prompt.text().strip(),
             int(self.post_lite_semantic_id.value()),
+            int(self.post_lite_instance_min_point_votes.value()),
+            int(self.post_lite_fused_min_instance_points.value()),
             int(self.post_lite_min_instance_points.value()),
             bool(self.post_lite_save_instance_parts.isChecked()),
-            self.sam3_checkpoint.text().strip(),
+            self.post_lite_sam3_checkpoint.text().strip(),
             self.sam3_device.currentText().strip(),
         )
 
@@ -1062,7 +1114,7 @@ class TrainQtWindow(QMainWindow):
             int(self.post_lite_image_size.value()),
             float(self.post_lite_fov_deg.value()),
             float(self.post_lite_xoy_step_multiplier.value()),
-            self.sam3_checkpoint.text().strip(),
+            self.post_lite_sam3_checkpoint.text().strip(),
             self.sam3_device.currentText().strip(),
             (self.post_lite_sam_prompt.text().strip() or "building"),
         )
@@ -1072,17 +1124,28 @@ class TrainQtWindow(QMainWindow):
         self._run_async_with_loading(
             "post_lite_render_only",
             "正在生成俯视渲染图...",
-            lambda: backend.run_postprocess_lite_split(*args, mode="render_only"),
+            lambda: backend.run_postprocess_lite_split(
+                *args,
+                mode="render_only",
+                run_post_lite_step1=True,
+                run_post_lite_step2=False,
+            ),
         )
 
     def on_post_lite_continue_instance(self) -> None:
         args = self._collect_post_lite_runner_args()
         selected_image = "all"
+        run_step1 = bool(self.run_post_lite_step1.isChecked())
+        run_step2 = bool(self.run_post_lite_step2.isChecked())
         self._run_async_with_loading(
             "post_lite_continue_instance",
             "正在基于当前渲染继续实例分割...",
             lambda: backend.run_postprocess_lite_split(
-                *args, mode="instance_from_renders", post_lite_mask_image=selected_image
+                *args,
+                mode="instance_from_renders",
+                post_lite_mask_image=selected_image,
+                run_post_lite_step1=run_step1,
+                run_post_lite_step2=run_step2,
             ),
         )
 

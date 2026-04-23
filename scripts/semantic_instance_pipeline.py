@@ -38,6 +38,16 @@ class CameraRecord:
     fy: float
     cx: float
     cy: float
+    projection_mode: str = "perspective"
+    ortho_x_min: float = 0.0
+    ortho_x_max: float = 0.0
+    ortho_y_min: float = 0.0
+    ortho_y_max: float = 0.0
+    # Orthographic vertical mapping mode:
+    # - auto: infer from pose convention
+    # - y_max_minus_y: v = (y_max - y) / (y_max - y_min)
+    # - y_minus_y_min: v = (y - y_min) / (y_max - y_min)
+    ortho_v_mode: str = "auto"
 
 
 @dataclass
@@ -568,6 +578,12 @@ def project_points(
     cy: float,
     width: int,
     height: int,
+    projection_mode: str = "perspective",
+    ortho_x_min: float = 0.0,
+    ortho_x_max: float = 0.0,
+    ortho_y_min: float = 0.0,
+    ortho_y_max: float = 0.0,
+    ortho_v_mode: str = "auto",
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     if len(xyz) == 0:
         empty = np.zeros((0,), dtype=np.int32)
@@ -585,8 +601,32 @@ def project_points(
     x = cam[valid, 0]
     y = cam[valid, 1]
     z = z[valid]
-    u = np.round(fx * (x / z) + cx).astype(np.int32)
-    v = np.round(fy * (y / z) + cy).astype(np.int32)
+    mode = (projection_mode or "perspective").lower()
+    if mode == "orthographic":
+        if not (ortho_x_max > ortho_x_min and ortho_y_max > ortho_y_min):
+            raise ValueError(
+                "Invalid orthographic bounds: "
+                f"x=[{ortho_x_min},{ortho_x_max}], y=[{ortho_y_min},{ortho_y_max}]"
+            )
+        u = np.round((x - ortho_x_min) / (ortho_x_max - ortho_x_min) * float(width - 1)).astype(np.int32)
+        v_mode = str(ortho_v_mode or "auto").strip().lower()
+        if v_mode == "auto":
+            # Heuristic for strict-topdown conventions:
+            #   w2c[1,1] > 0  -> y_max_minus_y
+            #   w2c[1,1] < 0  -> y_minus_y_min
+            # This matches both:
+            # - DOM-exported pose json (y axis positive)
+            # - current OpenGaussian strict_topdown_w2c convention (y axis negative)
+            y_sign = float(w2c[1, 1])
+            v_mode = "y_minus_y_min" if y_sign < 0.0 else "y_max_minus_y"
+
+        if v_mode in {"y_minus_y_min", "ymin_to_ymax", "direct"}:
+            v = np.round((y - ortho_y_min) / (ortho_y_max - ortho_y_min) * float(height - 1)).astype(np.int32)
+        else:
+            v = np.round((ortho_y_max - y) / (ortho_y_max - ortho_y_min) * float(height - 1)).astype(np.int32)
+    else:
+        u = np.round(fx * (x / z) + cx).astype(np.int32)
+        v = np.round(fy * (y / z) + cy).astype(np.int32)
 
     inside = (u >= 0) & (u < width) & (v >= 0) & (v < height)
     if not np.any(inside):
@@ -597,7 +637,11 @@ def project_points(
     z = z[inside]
     valid_idx = valid_idx[inside]
 
-    # Simple per-cluster z-buffer: keep nearest projected point per pixel.
+    # Perspective mode: keep nearest point per pixel (z-buffer style).
+    # Orthographic mode: keep all projected points to better match DOM-style footprint.
+    if mode == "orthographic":
+        return u, v, valid_idx
+
     linear = (v.astype(np.int64) * np.int64(width) + u.astype(np.int64))
     order = np.lexsort((z, linear))
     linear_s = linear[order]
@@ -637,7 +681,22 @@ def vote_cluster_to_mask_ids(
             cx = float(w) / 2.0
             cy = float(h) / 2.0
 
-        u, v, _ = project_points(core_xyz, cam.w2c, fx, fy, cx, cy, w, h)
+        u, v, _ = project_points(
+            core_xyz,
+            cam.w2c,
+            fx,
+            fy,
+            cx,
+            cy,
+            w,
+            h,
+            projection_mode=cam.projection_mode,
+            ortho_x_min=cam.ortho_x_min,
+            ortho_x_max=cam.ortho_x_max,
+            ortho_y_min=cam.ortho_y_min,
+            ortho_y_max=cam.ortho_y_max,
+            ortho_v_mode=cam.ortho_v_mode,
+        )
         if len(u) == 0:
             continue
         ids = mask[v, u].astype(np.int32)
@@ -823,7 +882,22 @@ def proj2d_instances(
             cx = float(w) / 2.0
             cy = float(h) / 2.0
 
-        u, v, pidx = project_points(xyz, cam.w2c, fx, fy, cx, cy, w, h)
+        u, v, pidx = project_points(
+            xyz,
+            cam.w2c,
+            fx,
+            fy,
+            cx,
+            cy,
+            w,
+            h,
+            projection_mode=cam.projection_mode,
+            ortho_x_min=cam.ortho_x_min,
+            ortho_x_max=cam.ortho_x_max,
+            ortho_y_min=cam.ortho_y_min,
+            ortho_y_max=cam.ortho_y_max,
+            ortho_v_mode=cam.ortho_v_mode,
+        )
         if len(pidx) == 0:
             continue
         ids = mask[v, u].astype(np.int32)
@@ -831,6 +905,8 @@ def proj2d_instances(
             keep = np.ones((len(ids),), dtype=np.bool_)
             for ig in ignore_ids:
                 keep &= (ids != int(ig))
+            u = u[keep]
+            v = v[keep]
             ids = ids[keep]
             pidx = pidx[keep]
             if len(pidx) == 0:
